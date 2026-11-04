@@ -1,1 +1,38 @@
-{"name":"flow-production-runner","private":true,"type":"module","scripts":{"flow":"tsx src/cli.ts","edit":"tsx src/edit.ts","narration-manifest":"tsx src/createNarrationManifest.ts","freesound":"node --use-system-ca --import tsx src/freesound.ts","mix-narration":"tsx src/mixNarration.ts","add-music-bed":"tsx src/addMusicBed.ts","add-title":"tsx src/addTitle.ts","review":"tsx src/review.ts","zernio":"node --use-system-ca --import tsx src/zernio.ts","typecheck":"tsc --noEmit"},"dependencies":{"@playwright/test":"^1.49.0","playwright":"^1.49.0"},"devDependencies":{"tsx":"^4.19.2","typescript":"^5.7.2","@types/node":"^22.10.2"}}
+{
+  "name": "flow-production-runner",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "login": "tsx src/login.ts",
+    "lock": "tsx src/lock.ts",
+    "flow": "tsx src/cli.ts",
+    "edit": "tsx src/edit.ts",
+    "narration-manifest": "tsx src/createNarrationManifest.ts",
+    "narration": "tsx src/narration.ts",
+    "freesound": "node --use-system-ca --import tsx src/freesound.ts",
+    "mix-narration": "tsx src/mixNarration.ts",
+    "add-music-bed": "tsx src/addMusicBed.ts",
+    "add-title": "tsx src/addTitle.ts",
+    "review": "tsx src/review.ts",
+    "production:check": "tsx src/prodCheck.ts",
+    "character-assets": "tsx src/characterAssets.ts",
+    "zernio": "node --use-system-ca --import tsx src/zernio.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test \"tests/*.mts\"",
+    "project": "tsx src/project.ts",
+    "video": "tsx src/video.ts"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "3.1159.0",
+    "@aws-sdk/s3-request-presigner": "3.1159.0",
+    "@google/genai": "^2.27.0",
+    "@playwright/test": "^1.49.0",
+    "openai": "^7.25.0",
+    "playwright": "^1.49.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

@@ -14,6 +14,8 @@ const inputDir = path.resolve(arg('--input-dir') ?? 'outputs');
 const output = path.resolve(arg('--output') ?? path.join(inputDir, 'final-with-fades.mp4'));
 const transition = Number(arg('--transition', '0.35'));
 if (!Number.isFinite(transition) || transition <= 0) throw new Error('--transition must be greater than 0');
+// Common frame rate applied to every input before xfade (see graph normalization below).
+const EDIT_FPS = Number(arg('--fps', '24'));
 
 const clips = (await fs.readdir(inputDir))
   .filter((file) => /^scene-\d{4}\.mp4$/i.test(file))
@@ -29,7 +31,11 @@ async function duration(file: string): Promise<number> {
 }
 
 const durations = await Promise.all(clips.map(duration));
-let graph = clips.map((_, i) => `[${i}:v]setpts=PTS-STARTPTS[v${i}];[${i}:a]asetpts=PTS-STARTPTS[a${i}]`).join(';');
+// Normalize every input to a COMMON frame rate + timebase BEFORE xfade. Flow clips can carry
+// differing timebases (e.g. 1/12288 vs 1/90000 for a differently-encoded clip), and xfade fails
+// hard when the two inputs' timebases differ ("First input link main timebase do not match...").
+// `fps=` re-times each input to a constant rate and unifies the timebase deterministically.
+let graph = clips.map((_, i) => `[${i}:v]fps=${EDIT_FPS},setpts=PTS-STARTPTS[v${i}];[${i}:a]asetpts=PTS-STARTPTS[a${i}]`).join(';');
 let runningDuration = durations[0];
 let video = 'v0';
 let audio = 'a0';

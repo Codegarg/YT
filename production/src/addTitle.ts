@@ -3,6 +3,7 @@ import { promisify } from 'node:util';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { markReviewPending } from './reviewState.js';
+import { buildTitleFfmpegArgs, buildTitleFilterGraph } from './titleGraph.js';
 
 const exec = promisify(execFile);
 const arg = (name: string, fallback?: string) => {
@@ -14,6 +15,9 @@ const input = path.resolve(arg('--input') ?? 'outputs/last-bus-narrated-synced.m
 const output = path.resolve(arg('--output') ?? 'outputs/last-bus-title.mp4');
 const title = arg('--title', 'AAKHRI BUS KI TEESRI SEAT')!;
 const skipTitle = process.argv.includes('--skip-title');
+const skipLogo = process.argv.includes('--skip-logo');
+// Opt-in, story-only treatment for the embedded Flow sparkle. The intro is never touched.
+const removeFlowSparkle = process.argv.includes('--remove-flow-sparkle');
 const projectFile = arg('--project');
 const intro = path.resolve(arg('--intro') ?? 'assets/channel-intro.mp4');
 const logo = path.resolve(arg('--logo') ?? 'assets/channel-logo.png');
@@ -21,7 +25,8 @@ const introSeconds = 5;
 const introFadeSeconds = 0.5;
 const escapeAss = (value: string) => value.replace(/[{}\\]/g, (char) => `\\${char}`);
 await fs.access(intro);
-await fs.access(logo);
+// --skip-logo is explicit and opt-in: the logo must not even be required in that mode.
+if (!skipLogo) await fs.access(logo);
 async function resolution(file: string): Promise<{ width: number; height: number }> {
   const { stdout } = await exec('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'csv=s=x:p=0', file]);
   const [width, height] = stdout.trim().split('x').map(Number);
@@ -50,25 +55,21 @@ Dialogue: 1,0:00:00.00,0:00:03.70,Kicker,,0,0,0,,{\\fad(400,700)\\fscx72\\fscy72
 `);
 const escapedAss = ass.replace(/\\/g, '/').replace(':', '\\:');
 const mainTitleFilter = skipTitle ? 'null' : `subtitles=filename='${escapedAss}':fontsdir='C\\:/Windows/Fonts'`;
-const graph = [
-  `[0:v]trim=duration=${introSeconds},scale=${storySize.width}:${storySize.height}:force_original_aspect_ratio=decrease,pad=${storySize.width}:${storySize.height}:(ow-iw)/2:(oh-ih)/2,fps=30,settb=AVTB,setsar=1,setpts=PTS-STARTPTS[introvideo]`,
-  `[1:v]${mainTitleFilter},scale=${storySize.width}:${storySize.height},fps=30,settb=AVTB,setsar=1,setpts=PTS-STARTPTS[storyvideo]`,
-  `[introvideo][storyvideo]xfade=transition=fade:duration=${introFadeSeconds}:offset=${introSeconds - introFadeSeconds}[joinedvideo]`,
-  `[2:v]format=rgba,scale=-1:${logoHeight}[brand]`,
-  `[joinedvideo][brand]overlay=x=W-w-${logoRight}:y=H-h-${logoBottom}:format=auto:shortest=1[video]`,
-  `[0:a]atrim=duration=${introSeconds},asetpts=PTS-STARTPTS[introaudio]`,
-  `[1:a]asetpts=PTS-STARTPTS[storyaudio]`,
-  `[introaudio][storyaudio]acrossfade=d=${introFadeSeconds}:c1=tri:c2=tri[audio]`,
-].join(';');
+const graph = buildTitleFilterGraph({
+  storySize, introSeconds, introFadeSeconds, mainTitleFilter, logoHeight, logoRight, logoBottom, skipLogo,
+  removeFlowSparkle,
+});
 
-await exec('ffmpeg', [
-  '-hide_banner', '-loglevel', 'error', '-y', '-i', intro, '-i', input, '-loop', '1', '-i', logo, '-filter_complex', graph, '-map', '[video]', '-map', '[audio]',
-  '-c:v', 'libx264', '-crf', '18', '-preset', 'medium', '-pix_fmt', 'yuv420p',
-  '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart', output,
-], { maxBuffer: 1024 * 1024 * 8 });
+await exec('ffmpeg', buildTitleFfmpegArgs({
+  intro, input, logo, output, graph, skipLogo,
+}), { maxBuffer: 1024 * 1024 * 8 });
 const review = projectFile ? await markReviewPending(path.resolve(projectFile), output, title) : undefined;
 console.log(JSON.stringify({
   input, output, title, skipTitle, titleEndSeconds: skipTitle ? 0 : 3.7, intro, introSeconds, logo,
-  logoPlacement: { height: logoHeight, right: logoRight, bottom: logoBottom }, review,
+  ...(skipLogo
+    ? { skipLogo: true, logoPlacement: null }
+    : { logoPlacement: { height: logoHeight, right: logoRight, bottom: logoBottom } }),
+  ...(removeFlowSparkle ? { removeFlowSparkle: true } : {}),
+  review,
   questions: review ? ['Should I approve this video?', 'Is it good to post on YouTube or not?'] : undefined,
 }));
