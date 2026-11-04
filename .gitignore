@@ -9,6 +9,9 @@ production/assets/channel-logo.*
 production/assets/*.png
 .railway/
 
+# Local publish destination allowlist (commit the .example.json instead)
+production/config/youtube-accounts.json
+
 # Generated projects and media
 scripting/projects/
 production/outputs/
@@ -28,3 +31,24 @@ npm-debug.log*
 
 .chrome-profile/
 .claude/
+
+# Local npm cache used during video setup
+production/.npm-cache/
+
+# Persistent Chrome/Playwright state: contains cookies and login data
+production/chrome-profile*/
+production/.playwright-browsers/
+production/.flow-session.lock
+*.publish.lock
+
+# Python environments
+scripting/.venv*/
+scripting/.venv.recovery-*/
+
+# Private project inputs and internal review reports
+production/inputs/
+production/reports/
+
+# Cached generated backgrounds
+production/assets/backgrounds/
+production/assets/**/*.png
