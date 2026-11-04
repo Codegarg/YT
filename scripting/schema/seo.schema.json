@@ -1,0 +1,294 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raat-ka-khauf.local/schema/seo-package.schema.json",
+  "title": "RAAT KA KHAUF YouTube SEO package",
+  "description": "Versioned, reviewable SEO output for one finished story project. Every package is validated against this schema before it is written, so a saved package is always structurally complete. The package may never contain measured search demand, timestamps or signed media URLs.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "engine_version",
+    "project_id",
+    "story_title",
+    "channel_profile",
+    "story_summary",
+    "keyword_ranking_basis",
+    "branded_keywords",
+    "primary_keywords",
+    "secondary_keywords",
+    "long_tail_keywords",
+    "story_keywords",
+    "title_candidates",
+    "recommended_title_index",
+    "recommended_title",
+    "title_rationale",
+    "title_selection",
+    "editorial_overrides",
+    "description",
+    "tags",
+    "tag_character_count",
+    "hashtags",
+    "pinned_comment",
+    "thumbnail_text",
+    "thumbnail_concept",
+    "thumbnail_image_prompt",
+    "thumbnail_style",
+    "shorts_concepts",
+    "generation_metadata",
+    "validation_warnings"
+  ],
+  "properties": {
+    "schema_version": { "type": "integer", "minimum": 1 },
+    "engine_version": { "type": "string", "minLength": 1 },
+    "project_id": { "type": "string", "minLength": 1 },
+    "project_file": { "type": ["string", "null"] },
+    "story_title": { "type": "string" },
+    "channel_profile": {
+      "type": "object",
+      "required": ["channel_name", "niche", "audience", "language_policy"],
+      "properties": {
+        "channel_name": { "type": "string", "minLength": 1 },
+        "niche": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+        "audience": { "type": "object" },
+        "language_policy": { "type": "object" }
+      }
+    },
+    "content_policy": {
+      "type": "object",
+      "description": "Factuality policy resolved from the channel profile plus story metadata.",
+      "required": ["mode", "fiction", "reject_truth_claims", "source"],
+      "properties": {
+        "mode": { "type": "string", "minLength": 1 },
+        "fiction": { "type": "boolean" },
+        "reject_truth_claims": { "type": "boolean" },
+        "source": { "type": "string" },
+        "disclosure_hi": { "type": ["string", "null"] },
+        "channel_statement": { "type": ["string", "null"] },
+        "story_metadata_evidence": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "story_summary": {
+      "type": "object",
+      "required": ["logline", "setting", "entity", "protagonist", "acts", "scene_count", "duration_minutes", "language", "timing_available", "source_refs"],
+      "properties": {
+        "logline": { "type": "string" },
+        "setting": { "type": "string" },
+        "entity": { "type": "string" },
+        "protagonist": { "type": "string" },
+        "acts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["act", "name", "beat", "source_ref"],
+            "properties": {
+              "act": { "type": "integer", "minimum": 1 },
+              "name": { "type": "string" },
+              "beat": { "type": "string" },
+              "source_ref": { "type": "string", "pattern": "^script\\.act:\\d+$" }
+            }
+          }
+        },
+        "scene_count": { "type": "integer", "minimum": 1 },
+        "duration_minutes": { "type": ["integer", "null"], "minimum": 1 },
+        "language": { "type": "string" },
+        "timing_available": { "type": "boolean" },
+        "source_refs": { "type": "array", "minItems": 1, "items": { "type": "string" } }
+      }
+    },
+    "keyword_ranking_basis": { "type": "string", "minLength": 1 },
+    "branded_keywords": { "$ref": "#/$defs/keywordList" },
+    "primary_keywords": { "$ref": "#/$defs/keywordList" },
+    "secondary_keywords": { "$ref": "#/$defs/keywordList" },
+    "long_tail_keywords": { "$ref": "#/$defs/keywordList" },
+    "keyword_plan_rejections": {
+      "type": "array",
+      "description": "Catalogue terms deliberately not used for this story, with the reason.",
+      "items": {
+        "type": "object",
+        "required": ["term", "class", "reason"],
+        "properties": {
+          "term": { "type": "string", "minLength": 1 },
+          "class": { "type": "string", "minLength": 1 },
+          "reason": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "story_keywords": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["term", "class", "intent", "priority_basis", "source_refs"],
+        "properties": {
+          "term": { "type": "string", "minLength": 1 },
+          "class": { "const": "story_specific" },
+          "intent": { "type": "string" },
+          "priority_basis": { "type": "string" },
+          "source_refs": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "title_candidates": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": {
+        "type": "object",
+        "required": ["text", "hook_type", "primary_phrase", "source_refs", "why", "heuristic_score", "heuristic_rank", "chars"],
+        "properties": {
+          "text": { "type": "string", "minLength": 1, "maxLength": 100 },
+          "hook_type": { "type": "string" },
+          "primary_phrase": { "type": "string" },
+          "source_refs": { "type": "array", "items": { "type": "string" } },
+          "why": { "type": "string" },
+          "heuristic_score": { "type": "integer", "minimum": 0, "maximum": 100 },
+          "heuristic_rank": { "type": "integer", "minimum": 1, "maximum": 3 },
+          "chars": { "type": "integer", "minimum": 1, "maximum": 100 }
+        }
+      }
+    },
+    "recommended_title_index": { "type": "integer", "minimum": 0, "maximum": 2 },
+    "recommended_title": { "type": "string", "minLength": 1, "maxLength": 100 },
+    "title_rationale": { "type": "string", "minLength": 40 },
+    "title_selection": {
+      "type": ["object", "null"],
+      "description": "Why this title won: deterministic heuristic rank or an explicit editorial override.",
+      "required": ["method", "selected_index", "model_recommended_index", "model_agrees"],
+      "properties": {
+        "method": { "enum": ["heuristic_top_rank", "editorial_override", "none"] },
+        "selected_index": { "type": "integer", "minimum": 0, "maximum": 2 },
+        "selected_rank": { "type": ["integer", "null"], "minimum": 1, "maximum": 3 },
+        "selected_score": { "type": ["integer", "null"], "minimum": 0, "maximum": 100 },
+        "selected_chars": { "type": ["integer", "null"], "minimum": 1 },
+        "top_ranked_index": { "type": ["integer", "null"], "minimum": 0, "maximum": 2 },
+        "top_ranked_text": { "type": ["string", "null"] },
+        "top_ranked_score": { "type": ["integer", "null"], "minimum": 0, "maximum": 100 },
+        "runner_up": { "type": ["object", "null"] },
+        "model_recommended_index": { "type": ["integer", "null"], "minimum": 0, "maximum": 2 },
+        "model_agrees": { "type": "boolean" },
+        "editorial_confirmed": { "type": "boolean" },
+        "tie_break": { "type": ["string", "null"] },
+        "override": {
+          "type": ["object", "null"],
+          "properties": {
+            "reason": { "type": "string", "minLength": 1 },
+            "requested_text": { "type": "string", "minLength": 1 },
+            "selected_rank": { "type": ["integer", "null"] },
+            "selected_score": { "type": ["integer", "null"] },
+            "top_ranked_text": { "type": ["string", "null"] },
+            "top_ranked_score": { "type": ["integer", "null"] },
+            "score_gap": { "type": "integer" }
+          }
+        }
+      }
+    },
+    "editorial_overrides": {
+      "type": ["object", "null"],
+      "description": "Fields explicitly replaced by the editor, with source hash and reason.",
+      "properties": {
+        "source": { "type": "string" },
+        "sha256": { "type": "string" },
+        "reason": { "type": "string" },
+        "applied_fields": { "type": "array", "items": { "type": "string" } },
+        "archived_as": { "type": "string" },
+        "title": { "type": "object" }
+      }
+    },
+    "description": { "type": "string", "minLength": 300, "maxLength": 5000 },
+    "tags": {
+      "type": "array",
+      "minItems": 8,
+      "items": { "type": "string", "minLength": 1, "maxLength": 30 }
+    },
+    "tag_character_count": { "type": "integer", "minimum": 0, "maximum": 500 },
+    "hashtags": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 8,
+      "items": { "type": "string", "pattern": "^#[\\u0900-\\u097FA-Za-z0-9_]{2,40}$" }
+    },
+    "pinned_comment": { "type": "string", "minLength": 40 },
+    "thumbnail_text": { "type": "string", "minLength": 1 },
+    "thumbnail_concept": {
+      "type": "object",
+      "required": ["main_subject", "composition", "background_lighting", "color_contrast"],
+      "properties": {
+        "main_subject": { "type": "string", "minLength": 1 },
+        "composition": { "type": "string", "minLength": 1 },
+        "background_lighting": { "type": "string", "minLength": 1 },
+        "color_contrast": { "type": "string", "minLength": 1 }
+      }
+    },
+    "thumbnail_image_prompt": { "type": "string", "minLength": 20, "pattern": "--ar 16:9$" },
+    "thumbnail_style": { "type": "string" },
+    "shorts_concepts": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": {
+        "type": "object",
+        "required": ["hook", "title", "description", "hashtags", "opening_narration", "scene_refs", "timing_note", "cta"],
+        "properties": {
+          "hook": { "type": "string", "minLength": 1 },
+          "title": { "type": "string", "minLength": 1, "maxLength": 100 },
+          "description": { "type": "string", "minLength": 1, "maxLength": 5000 },
+          "hashtags": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+          "opening_narration": { "type": "string", "minLength": 1 },
+          "scene_refs": { "type": "array", "items": { "type": "integer", "minimum": 1 } },
+          "timing_note": { "type": "string", "minLength": 1 },
+          "cta": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "generation_metadata": {
+      "type": "object",
+      "required": [
+        "generated_at",
+        "generation",
+        "regenerated",
+        "engine_version",
+        "provider",
+        "attempts",
+        "max_attempts",
+        "prompt_template",
+        "prompt_sha256",
+        "approval_required_for_publishing",
+        "validation_warnings"
+      ],
+      "properties": {
+        "generated_at": { "type": "string", "minLength": 10 },
+        "generation": { "type": "integer", "minimum": 1 },
+        "regenerated": { "type": "boolean" },
+        "engine_version": { "type": "string" },
+        "provider": { "type": "object" },
+        "attempts": { "type": "integer", "minimum": 1, "maximum": 5 },
+        "repair_attempts": { "type": "integer", "minimum": 0, "maximum": 4 },
+        "max_attempts": { "type": "integer", "minimum": 1, "maximum": 5 },
+        "prompt_template": { "type": "string" },
+        "prompt_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "previous_package_sha256": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$" },
+        "previous_generation_snapshot": { "type": ["object", "null"] },
+        "approval_required_for_publishing": { "const": true },
+        "validation_warnings": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "validation_warnings": { "type": "array", "items": { "type": "string" } }
+  },
+  "$defs": {
+    "keywordList": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["term", "class", "intent", "source", "heuristic_score", "priority", "priority_basis", "ranking_inputs"],
+        "properties": {
+          "term": { "type": "string", "minLength": 1 },
+          "class": { "type": "string", "minLength": 1 },
+          "intent": { "type": "string", "minLength": 1 },
+          "source": { "type": "string" },
+          "heuristic_score": { "type": "integer", "minimum": 0, "maximum": 100 },
+          "priority": { "enum": ["high", "medium", "low"] },
+          "priority_basis": { "type": "string", "minLength": 1 },
+          "ranking_inputs": { "type": "object" }
+        }
+      }
+    }
+  }
+}

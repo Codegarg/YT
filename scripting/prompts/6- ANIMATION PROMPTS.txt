@@ -1,8 +1,10 @@
 6- ANIMATION PROMPTS No.5-
 
-Break the script into natural-length scenes covering the ENTIRE video. Let the generation choose the duration needed for each action and complete spoken line. State at the top:
+Break the script into a natural number of scenes covering the ENTIRE video. Let the generation choose the duration needed for each action and complete spoken line. State at the top:
 
-"Duration: {{DURATION_MINUTES}} min | Minimum Scenes: {{MINIMUM_SCENES}} | Generating: {{SCENE_COUNT}}"
+"Duration: {{DURATION_MINUTES}} min | Scenes: natural (min {{MINIMUM_SCENES}}, max {{MAX_SCENES}})"
+
+Determine the natural number of scenes required by the story and use the minimum number needed to tell the complete story. Do NOT pad scenes and do NOT target the maximum. Never exceed {{MAX_SCENES}} scenes. Preserve setup, escalation, climax and resolution. If the story has more individual beats than fit within {{MAX_SCENES}} scenes, merge related or adjacent beats rather than creating unnecessary scenes. Renumber scenes sequentially from 1.
 
 Use ONLY my uploaded assets via their tags (@CHAR-XX-NAME, #BGD-XX-NAME). Copy each dialogue line EXACTLY from Step 2 (Devanagari, same words).
 

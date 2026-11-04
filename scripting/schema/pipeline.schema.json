@@ -1,4 +1,91 @@
 {
-  "$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","required":["schema_version","project_id","idea","script","characters","backgrounds","scenes","publishing"],
-  "properties":{"schema_version":{"type":"string"},"project_id":{"type":"string"},"idea":{"type":"object"},"script":{"type":"object"},"characters":{"type":"array"},"backgrounds":{"type":"array"},"scenes":{"type":"array"},"publishing":{"type":"object"},"review":{"type":"object","properties":{"status":{"enum":["awaiting_approval","approved","rejected","posted","failed"]},"video_path":{"type":"string"},"title":{"type":"string"}},"required":["status","video_path"]}}
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["schema_version", "project_id", "idea", "script", "characters", "backgrounds", "scenes", "publishing"],
+  "properties": {
+    "schema_version": { "type": "string" },
+    "project_id": { "type": "string" },
+    "wardrobe_schema_version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Optional opt-in marker for the explicit appearance_lock/wardrobe contract. Legacy projects omit it."
+    },
+    "idea": { "type": "object" },
+    "script": { "type": "object" },
+    "characters": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "tag": { "type": "string" },
+          "name": { "type": "string" },
+          "look_summary": { "type": "string" },
+          "full_prompt": { "type": "string" },
+          "appearance_lock": {
+            "type": "object",
+            "description": "Physical identity only. Never clothing, expression, pose or reference-sheet language.",
+            "properties": {
+              "age": { "type": "string" },
+              "gender": { "type": "string" },
+              "build": { "type": "string" },
+              "skin": { "type": "string" },
+              "face": { "type": "string" },
+              "hair": { "type": "string" },
+              "facial_hair": { "type": "string" },
+              "marks": { "type": "string" }
+            }
+          },
+          "wardrobe": {
+            "type": "object",
+            "description": "The only source of clothing for scene prompts.",
+            "properties": {
+              "default_outfit": { "type": "string" },
+              "outfits": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "object",
+                  "properties": {
+                    "label": { "type": "string" },
+                    "top": { "type": "string" },
+                    "bottom": { "type": "string" },
+                    "outerwear": { "type": "string" },
+                    "footwear": { "type": "string" },
+                    "accessories": { "type": "string" },
+                    "hair": { "type": "string" },
+                    "notes": { "type": "string" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "backgrounds": { "type": "array" },
+    "scenes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "scene_number": { "type": "integer" },
+          "speaker": { "type": "string" },
+          "outfit_ids": {
+            "type": "object",
+            "description": "Optional intentional outfit changes, keyed by character tag.",
+            "additionalProperties": { "type": "string" }
+          }
+        }
+      }
+    },
+    "publishing": { "type": "object" },
+    "review": {
+      "type": "object",
+      "properties": {
+        "status": { "enum": ["awaiting_approval", "approved", "rejected", "posted", "failed"] },
+        "video_path": { "type": "string" },
+        "title": { "type": "string" }
+      },
+      "required": ["status", "video_path"]
+    }
+  }
 }

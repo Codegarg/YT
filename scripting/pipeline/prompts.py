@@ -6,6 +6,7 @@ STYLE_LOCK = (ROOT.parent / "style_reference.md").read_text(encoding="utf-8")
 FILES = {
     "ideas": "1- IDEA GENERATION.txt", "story": "3- STORY.txt", "characters": "4- CHARACTER IMAGE PROMPTS.txt",
     "backgrounds": "5- IMAGE PROMPTS.txt", "scenes": "6- ANIMATION PROMPTS.txt", "publishing": "7- UPLOADING.txt",
+    "seo": "8- SEO.txt",
 }
 
 def render(stage: str, values: dict[str, object]) -> str:

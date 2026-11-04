@@ -1,6 +1,9 @@
 """Provider-neutral text client for the scripting half of the pipeline."""
 import json
 import os
+import random
+import re
+import time
 from typing import Literal
 
 from dotenv import load_dotenv
@@ -9,6 +12,51 @@ load_dotenv()
 
 Provider = Literal["openai", "groq"]
 DEFAULT_MODELS: dict[Provider, str] = {"openai": "gpt-4.1-mini", "groq": "openai/gpt-oss-120b"}
+
+
+def _retry_max_seconds() -> float:
+    """Total time budget for retrying a single provider call (default 6 hours)."""
+    return max(0.0, float(os.getenv("SCRIPT_RETRY_MAX_HOURS", "6")) * 3600.0)
+
+
+def _retry_base_seconds() -> float:
+    return max(1.0, float(os.getenv("SCRIPT_RETRY_BASE_SECONDS", "5")))
+
+
+def _retry_cap_seconds() -> float:
+    return max(_retry_base_seconds(), float(os.getenv("SCRIPT_RETRY_MAX_SECONDS", "300")))
+
+
+def _status_code(error: Exception) -> int | None:
+    for candidate in (getattr(error, "status_code", None), getattr(getattr(error, "response", None), "status_code", None)):
+        if isinstance(candidate, int):
+            return candidate
+    return None
+
+
+def _retryable(error: Exception) -> bool:
+    """Retry rate limits, upstream 5xx errors, and transient network failures."""
+    status = _status_code(error)
+    if status is not None:
+        return status == 429 or 500 <= status < 600
+    name = type(error).__name__
+    return name in {"RateLimitError", "APIConnectionError", "APITimeoutError", "InternalServerError", "APIError"}
+
+
+def _retry_after_seconds(error: Exception) -> float | None:
+    headers = getattr(getattr(error, "response", None), "headers", None)
+    if headers is not None:
+        try:
+            value = headers.get("retry-after") or headers.get("Retry-After")
+        except Exception:
+            value = None
+        if value:
+            try:
+                return float(value)
+            except ValueError:
+                pass
+    match = re.search(r"try again in\s+([\d.]+)\s*s", str(error), re.I)
+    return float(match.group(1)) if match else None
 
 
 def select_provider() -> Provider:
@@ -33,14 +81,32 @@ class ScriptClient:
             self.client = Groq()
 
     def complete(self, prompt: str, max_tokens: int = 7000, temperature: float = 0) -> str:
-        response = self.client.chat.completions.create(
-            model=self.model, max_tokens=max_tokens, temperature=temperature,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        content = response.choices[0].message.content or ""
-        if not content.strip():
-            raise ValueError(f"{self.provider} returned an empty response")
-        return content
+        deadline = time.monotonic() + _retry_max_seconds()
+        attempt = 0
+        while True:
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model, max_tokens=max_tokens, temperature=temperature,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                content = response.choices[0].message.content or ""
+                if not content.strip():
+                    raise ValueError(f"{self.provider} returned an empty response")
+                return content
+            except ValueError:
+                raise
+            except Exception as error:
+                if not _retryable(error) or time.monotonic() >= deadline:
+                    raise
+                suggested = _retry_after_seconds(error)
+                backoff = min(_retry_base_seconds() * (2 ** attempt), _retry_cap_seconds())
+                delay = max(suggested or 0.0, backoff) + random.uniform(0, 1)
+                remaining = deadline - time.monotonic()
+                if delay > remaining:
+                    raise
+                attempt += 1
+                print(f"[retry] {self.provider} call failed ({type(error).__name__}); waiting {delay:.0f}s before attempt {attempt}", flush=True)
+                time.sleep(delay)
 
 
 # Compatibility names used by the existing stage CLI.

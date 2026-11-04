@@ -26,10 +26,10 @@ def run_all(project, client, language, duration, monster, scene_count=None, chec
         requested_scenes=scene_count or duration*7
         compact_chars=[{"tag":c.get("tag"),"name":c.get("name"),"look_summary":c.get("look_summary")} for c in project["characters"]]
         compact_bgs=[{"tag":b.get("tag"),"location_name":b.get("location_name"),"look_summary":b.get("look_summary")} for b in project["backgrounds"]]
-        data,raw=call(project,client,"scenes",{"SCRIPT":script,"CHARACTERS":compact_chars,"BACKGROUNDS":compact_bgs,"DURATION_MINUTES":duration,"MINIMUM_SCENES":duration*7,"SCENE_COUNT":requested_scenes},parsers.scenes)
+        data,raw=call(project,client,"scenes",{"SCRIPT":script,"CHARACTERS":compact_chars,"BACKGROUNDS":compact_bgs,"DURATION_MINUTES":duration,"MINIMUM_SCENES":2,"MAX_SCENES":35},parsers.scenes)
         project["scenes_raw_output"] = raw
         if checkpoint: checkpoint()
-        if len(data) != requested_scenes: raise ValueError(f"Expected exactly {requested_scenes} scenes, parsed {len(data)}")
+        if not (2 <= len(data) <= 35): raise ValueError(f"Expected 2–35 scenes, parsed {len(data)}")
         project["scenes"]=data
         if checkpoint: checkpoint()
     if project["publishing"]["data"] is None:

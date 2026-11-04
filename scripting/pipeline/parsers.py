@@ -1,5 +1,6 @@
 import re
 from .anthropic_client import parse_jsonish
+from .prompt_safety import strip_internal_tags
 
 TAG_CHAR = re.compile(r"@[A-Z0-9_-]+")
 TAG_BG = re.compile(r"#[A-Z0-9_-]+")
@@ -16,7 +17,7 @@ def characters(raw):
     out = []
     for item in items:
         tag = item.get("tag") or item.get("asset_tag") or next(iter(TAG_CHAR.findall(str(item))), None)
-        out.append({"status":"pending","error":None,"tag":tag,"name":item.get("name"),"look_summary":item.get("look_summary", ""),"full_prompt":item.get("full_prompt") or item.get("prompt", ""),"voice":item.get("voice", {})})
+        out.append({"status":"pending","error":None,"tag":tag,"name":item.get("name"),"age":item.get("age"),"gender":item.get("gender"),"profession":item.get("profession"),"personality":item.get("personality"),"look_summary":item.get("look_summary", ""),"full_prompt":item.get("full_prompt") or item.get("prompt", ""),"appearance_lock":item.get("appearance_lock") if isinstance(item.get("appearance_lock"), dict) else None,"wardrobe":item.get("wardrobe") if isinstance(item.get("wardrobe"), dict) else None,"voice":item.get("voice", {}),"voice_description":item.get("voice_description", "")})
     return out
 
 def backgrounds(raw):
@@ -29,22 +30,23 @@ def backgrounds(raw):
     return out
 
 def _narrator_variant(prompt: str) -> str:
+    prompt = strip_internal_tags(prompt)
     lines = prompt.splitlines(); kept=[]; inside=False
     for line in lines:
         u=line.upper()
         if "LIP-SYNC" in u or "DIALOGUE" in u: inside=True
         if not inside: kept.append(line)
         if inside and ("NEGATIVE RESTRICTIONS" in u or "NEGATIVE" in u): inside=False; kept.append(line)
-    return "\n".join(kept).rstrip() + "\nDo not add any dialogue."
+    return strip_internal_tags("\n".join(kept).rstrip() + "\nDo not add any dialogue.")
 
 def scenes(raw):
     try: data = parse_jsonish(raw); items = data if isinstance(data, list) else data.get("scenes", data.get("items", []))
     except ValueError: return _text_scenes(raw)
     out=[]
     for i, item in enumerate(items, 1):
-        speaker=item.get("speaker", "none"); anim=item.get("animation_prompt_WITH_lipsync") or item.get("animation_prompt_with_lipsync") or item.get("animation_prompt", "")
-        narrator=item.get("animation_prompt_NARRATOR_ONLY") or _narrator_variant(anim)
-        out.append({"status":"pending","error":None,"scene_number":item.get("scene_number",i),"title":item.get("title",""),"timestamp":item.get("timestamp","AUTO — determined by the completed Flow clip"),"clip_length_seconds":None,"assets":{"background_tag":item.get("background_tag"),"character_tags":item.get("character_tags",[])},"speaker":speaker,"still_image_prompt":item.get("still_image_prompt", ""),"animation_prompt_WITH_lipsync":anim,"animation_prompt_NARRATOR_ONLY":narrator,"devanagari_dialogue":item.get("devanagari_dialogue", item.get("dialogue", "")),"narration_text":item.get("narration_text", "")})
+        speaker=item.get("speaker", "none"); anim=strip_internal_tags(item.get("animation_prompt_WITH_lipsync") or item.get("animation_prompt_with_lipsync") or item.get("animation_prompt", ""))
+        narrator=strip_internal_tags(item.get("animation_prompt_NARRATOR_ONLY") or _narrator_variant(anim))
+        out.append({"status":"pending","error":None,"scene_number":item.get("scene_number",i),"title":item.get("title",""),"timestamp":item.get("timestamp","AUTO — determined by the completed Flow clip"),"clip_length_seconds":None,"assets":{"background_tag":item.get("background_tag"),"character_tags":item.get("character_tags",[])},"speaker":speaker,"outfit_ids":item.get("outfit_ids") if isinstance(item.get("outfit_ids"), dict) else {},"still_image_prompt":strip_internal_tags(item.get("still_image_prompt", "")),"animation_prompt_WITH_lipsync":anim,"animation_prompt_NARRATOR_ONLY":narrator,"devanagari_dialogue":item.get("devanagari_dialogue", item.get("dialogue", "")),"narration_text":item.get("narration_text", "")})
     return out
 
 def publishing(raw):
@@ -94,6 +96,6 @@ def _text_scenes(raw):
         still=re.search(r"STILL\s+IMAGE\s+PROMPT\s*:?\s*(.*?)(?=---\s*##\s+ANIMATION|##\s+ANIMATION|$)",block,re.I|re.S)
         anim=re.search(r"(?:ANIMATION\s*\+\s*AUDIO\s+PROMPT|ANIMATION\s*\+\s*AUDIO\s+PROMPT:)(.*)$",block,re.I|re.S)
         asset_text=assets.group(1) if assets else ""; bg=next(iter(TAG_BG.findall(asset_text)),None); chars=TAG_CHAR.findall(asset_text); speaker=(sp.group(1).strip() if sp else "none").split()[0]
-        anim_text=anim.group(1).strip() if anim else ""; dialogue=re.search(r"DIALOGUE[^:]*:\s*[\"“](.*?)[\"”]",anim_text,re.I|re.S)
-        out.append({"status":"pending","error":None,"scene_number":int(m.group(1)),"title":m.group(2).strip(),"timestamp":ts.group(1).strip() if ts else "AUTO — determined by the completed Flow clip","clip_length_seconds":None,"assets":{"background_tag":bg,"character_tags":chars},"speaker":speaker,"still_image_prompt":still.group(1).strip() if still else "","animation_prompt_WITH_lipsync":anim_text,"animation_prompt_NARRATOR_ONLY":_narrator_variant(anim_text) if speaker in {"NARRATOR","none"} else _narrator_variant(anim_text),"devanagari_dialogue":dialogue.group(1).strip() if dialogue else "","narration_text":""})
+        anim_text=strip_internal_tags(anim.group(1).strip() if anim else ""); dialogue=re.search(r"DIALOGUE[^:]*:\s*[\"“](.*?)[\"”]",anim_text,re.I|re.S)
+        out.append({"status":"pending","error":None,"scene_number":int(m.group(1)),"title":m.group(2).strip(),"timestamp":ts.group(1).strip() if ts else "AUTO — determined by the completed Flow clip","clip_length_seconds":None,"assets":{"background_tag":bg,"character_tags":chars},"speaker":speaker,"outfit_ids":{},"still_image_prompt":strip_internal_tags(still.group(1).strip() if still else ""),"animation_prompt_WITH_lipsync":anim_text,"animation_prompt_NARRATOR_ONLY":_narrator_variant(anim_text) if speaker in {"NARRATOR","none"} else _narrator_variant(anim_text),"devanagari_dialogue":dialogue.group(1).strip() if dialogue else "","narration_text":""})
     return out
