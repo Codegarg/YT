@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "projects": {
+    "your-project-id": {
+      "accountId": "YOUR_APPROVED_YOUTUBE_ACCOUNT_ID",
+      "displayName": "Your channel"
+    }
+  }
+}
