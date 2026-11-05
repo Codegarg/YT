@@ -18,6 +18,7 @@
     "character-assets": "tsx src/characterAssets.ts",
     "zernio": "node --use-system-ca --import tsx src/zernio.ts",
     "typecheck": "tsc --noEmit",
+    "smoke": "tsx src/smoke.ts",
     "test": "node --import tsx --test \"tests/*.mts\"",
     "project": "tsx src/project.ts",
     "video": "tsx src/video.ts"

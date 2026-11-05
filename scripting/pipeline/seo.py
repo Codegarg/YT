@@ -38,6 +38,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import prompts
+from .paths import resolve_projects_root
 from .seo_keywords import (
     CHANNEL_PROFILE,
     ENGINE_VERSION as KEYWORD_ENGINE_VERSION,
@@ -2212,7 +2213,7 @@ def resolve_project_file(project: str | None, project_id: str | None) -> Path:
             path = Path.cwd() / path
         return path.resolve()
     if project_id:
-        root = Path(os.environ.get("PROJECTS_DIR", "projects"))
+        root = resolve_projects_root()
         return (root / project_id / "pipeline.json").resolve()
     raise SeoInputError("pass --project <pipeline.json> or --project-id <id>")
 

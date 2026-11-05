@@ -331,7 +331,12 @@ const S2_FACTOR = S2_REQUIRED / S2_CLIP;                    // 2.42125
     /buildMixFilterGraph/.test(code) && /buildMixOutputArgs/.test(code));
   // the CLI wires only the isolated operation
   const vcode = fs2.readFileSync(`${SRC}/video.ts`, 'utf8');
-  const seg = vcode.slice(vcode.indexOf("command === 'mix-validate'"), vcode.indexOf('Usage: npm run video -- <create|resume|status|approve|publish-status|health|mix-validate>'));
+  const segStart = vcode.indexOf("command === 'mix-validate'");
+  const segEnd = vcode.indexOf('console.error(renderUsage());', segStart);
+  // The slice must span exactly the mix-validate branch; a missing anchor would otherwise
+  // silently widen it to the end of the file.
+  check('7: the mix-validate branch and its terminator both exist', segStart >= 0 && segEnd > segStart, { segStart, segEnd });
+  const seg = vcode.slice(segStart, segEnd);
   check('7: the mix-validate CLI branch calls ONLY plan+runIsolatedSceneMix',
     /planIsolatedSceneMix/.test(seg) && /runIsolatedSceneMix/.test(seg)
     && !/resumeProjectWorkflow|createProjectWorkflow|approveProject|publishReadiness|createRealFlowRunner|withFlowSession|createRealSceneExecutor/.test(seg), seg.slice(0, 300));

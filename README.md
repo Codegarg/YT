@@ -5,9 +5,27 @@ This repository contains a two-half pipeline:
 - `scripting/`: OpenAI-or-Groq API orchestration for idea -> script -> assets -> scenes -> publishing metadata.
 - `production/`: Playwright browser automation for Google Flow using a persistent Chrome profile.
 
+## Setup from a fresh clone (Windows)
+
+Nothing in this repository depends on the authoring machine. A new machine needs Git, Node.js >= 20, Python >= 3.10 and FFmpeg, then:
+
+```powershell
+git clone https://github.com/Codegarg/YT.git
+cd YT
+cd production; npm ci; cd ..
+cd scripting; python -m venv .venv; .\.venv\Scripts\python.exe -m pip install -r requirements.txt; cd ..
+cd production; npm run smoke
+```
+
+`npm run smoke` is the offline readiness check: it verifies Node dependencies, typecheck, Python imports and packages, the JSON schemas, FFmpeg, the CLI, configuration, and the runtime directory layout. It never opens Chrome, never calls Flow, never spends credits, never uploads or publishes, and writes only inside `%TEMP%`.
+
+A clone contains no project data. `video create` creates `scripting/projects/<project-id>/` and `production/outputs/<project-id>/`; `production/inputs/` is human-supplied and is **never** auto-created, so create it once with `New-Item -ItemType Directory -Force production\inputs`.
+
+The full procedure — FFmpeg installation, local configuration, runtime directories, environment-variable reference, project recovery and troubleshooting — is in [`docs/SETUP_WINDOWS.md`](docs/SETUP_WINDOWS.md).
+
 ## Fastest local workflow: give one title
 
-This is a local-only project. Nothing requires Railway or a cloud browser session. Copy `scripting/.env.example` to `scripting/.env`, add either your OpenAI or Groq key, ensure Chrome is logged into Google Flow, then run:
+This is a local-only project. Nothing requires Railway or a cloud browser session. Complete [`docs/SETUP_WINDOWS.md`](docs/SETUP_WINDOWS.md) once (Node, Python, FFmpeg), then copy `scripting/.env.example` to `scripting/.env`, add either your OpenAI or Groq key, ensure Chrome is logged into Google Flow, then run:
 
 ```powershell
 .\start-video.ps1 -Title "आख़िरी बस की तीसरी सीट" -Concept "बरसाती रात में तीसरी सीट पर बैठी प्रेत-आत्मा"
@@ -114,12 +132,13 @@ existing approval and publishing gates. Full design, validation rules and limita
 
 ## Half B: production
 
-Install Playwright and its browser once:
+Install the production dependencies once:
 
 ```powershell
 cd production
-npm install
-npx playwright install chrome
+npm ci
+# Flow runs through your installed Google Chrome (FLOW_BROWSER_CHANNEL defaults to "chrome").
+# If Chrome is not installed system-wide, `npx playwright install chrome` fetches one for Playwright.
 npm run flow -- --project ..\scripting\projects\village-well\pipeline.json --user-data-dir .\chrome-profile --output-dir .\outputs
 ```
 
@@ -175,11 +194,15 @@ The music downloader saves a license record beside the downloaded file. Final FF
 
 ### Read-only checks before approval
 
-Two checks never write, never call a paid API and never upload. Run them before the approval questions:
+Three checks never write, never call a paid API and never upload. Run them before the approval questions:
 
 ```powershell
+# 0. environment/setup readiness for this checkout (offline, free, temp writes only)
+cd production
+npm run smoke
+
 # 1. story/scene structure + repetition/opening/ending warnings (never writes pipeline.json)
-cd scripting
+cd ..\scripting
 .venv\Scripts\python.exe -m pipeline.one_minute --project-id your-project --check
 cd ..\production
 
@@ -359,14 +382,30 @@ The command never prints, returns, or persists the presigned URL, credentials, r
 
 ## Configuration
 
+Local credentials live in `scripting/.env` (ignored by Git; copy `scripting/.env.example`). `start-video.ps1` loads that file into the process environment before delegating to `npm run video`; a direct `npm run video` invocation uses the ambient process environment only, so export the key first if you bypass the wrapper.
+
 Set optional production environment variables:
 
 ```text
-FLOW_URL=https://labs.google/flow
-FLOW_PROJECT_NAME=Hindi Folk Horror
-FLOW_IMAGE_MODEL=
-FLOW_VIDEO_MODEL=
-FLOW_RATE_LIMIT_MS=1500
+# Flow (production half)
+FLOW_URL=https://flow.google.com
+FLOW_PROJECT_URL=
+FLOW_USER_DATA_DIR=
+FLOW_BROWSER_CHANNEL=chrome
+FLOW_DOWNLOAD_DIR=
+FLOW_LOGIN_TIMEOUT_MS=600000
+
+# Tools and runtime locations
+FFMPEG_PATH=
+FFPROBE_PATH=
+CHROME_PATH=
+PROJECTS_ROOT=
+INPUTS_ROOT=
+OUTPUTS_ROOT=
+LOG_MAX_BYTES=5000000
+LOG_RETENTION=5
+
+# Publishing and music (optional)
 ZERNIO_API_KEY=
 R2_ACCOUNT_ID=
 R2_ACCESS_KEY_ID=
@@ -378,5 +417,7 @@ FREESOUND_CLIENT_ID=
 FREESOUND_CLIENT_SECRET=
 FREESOUND_REFRESH_TOKEN=
 ```
+
+The Flow project is selected from the `flow_project_name` value inside each project's `pipeline.json`, not from an environment variable. `FLOW_PROJECT_URL` overrides that with a direct `https://flow.google.com/project/<uuid>` URL and is the escape hatch when the duplicate-project guard cannot find the card. Set `PROJECTS_ROOT` to an **absolute** path if you relocate projects: the Python entry points also honour an absolute `PROJECTS_ROOT` (with `PROJECTS_DIR` taking precedence). Every variable, its default and who reads it is listed in [`docs/SETUP_WINDOWS.md`](docs/SETUP_WINDOWS.md#11-environment-variable-reference).
 
 Selectors are data, not logic. If Flow changes, update the selector candidates and the wait predicates in `production/src/flowClient.ts`.

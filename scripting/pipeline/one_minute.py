@@ -3,19 +3,19 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 from pathlib import Path
 
 from .anthropic_client import ScriptClient
 from .models import new_project, save
+from .paths import resolve_projects_root
 from .prompts import render, STYLE_LOCK
 from .prompt_safety import strip_internal_tags
 from .voice_selector import select_flow_voice
 
 CHAR_TAG = re.compile(r"^@CHAR-\d{2}-[A-Z][A-Z0-9-]*$")
 BG_TAG = re.compile(r"^#BGD-\d{2}-[A-Z][A-Z0-9-]*$")
-PROJECTS_ROOT = Path(os.environ.get("PROJECTS_DIR", "projects"))
+PROJECTS_ROOT = resolve_projects_root()
 DEFAULT_SCENES_PER_MINUTE = 7
 SCENE_BATCH_SIZE = 12
 WORDS_PER_MINUTE = 150

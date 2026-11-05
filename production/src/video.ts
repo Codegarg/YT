@@ -179,8 +179,49 @@ function emit(r: WorkflowResult): number {
   return workflowExitCode(r);
 }
 
+/**
+ * Usage text. Printed on stdout for an explicit `help`/`--help` (exit 0) and on stderr for an
+ * unrecognised command (exit 2), so `--help` is always a safe, side-effect-free smoke check.
+ */
+export function renderUsage(): string {
+  return [
+    'Usage: npm run video -- <create|resume|status|approve|publish-status|health|seo|qa|mix-validate>',
+    '  [--title ...] [--project <pipeline.json>] [--only 1,2,3] [--run-flow] [--flow-session] [--yes] [--json]',
+    '  create: [--seo]   # opt-in: also generate the reviewable SEO package for the new story',
+    '  approve: [--candidate <path inside project outputs> --sha256 <expected SHA-256>]',
+    '  seo: --project <pipeline.json> | --project-id <id>',
+    '       [--regenerate] [--extract-only] [--max-attempts 1..5] [--model <name>]',
+    '       [--approve-metadata --yes --by <name>]',
+    '       # writes <project>/seo/ only; never uploads, never calls Zernio/YouTube/R2.',
+    '  qa: --input <media file> [--json]',
+    '      [--target-lufs -14] [--loudness-tolerance 3] [--min-height 720] [--target-height 1080]',
+    '      [--expect-duration <s>] [--duration-tolerance 2] [--black-min 0.5] [--freeze-min 3]',
+    '      [--skip-black] [--skip-freeze] [--skip-audio]',
+    '      # READ-ONLY: black/freeze frames, 16:9 + resolution, clipping, loudness.',
+    '      # Never renders, writes, uploads or publishes; exit 1 only for hard FAIL findings.',
+    '  mix-validate: [--scene N] --input-root <production/inputs/<projectId>> --validation-root <isolated dir>',
+    '                 [--output <file>] [--force] [--max-stretch <x>]',
+    '                 # renders ONE scene; never runs EDIT/MIX-stage/BED/TITLE/APPROVAL,',
+    '                 # never writes production scene outputs or final-assembly media.',
+    '                 # --max-stretch raises the ELIGIBILITY CEILING for this isolated run only.',
+    '                 # Omitted, it stays at the 2.0x policy limit; hard ceiling is 3.0x.',
+    '                 # It never changes the computed duration, the graph, or production behaviour.',
+    '  help: print this text and exit 0 (no files read, no network, no Flow).',
+    '',
+    'Runtime directories (defaults, all overridable):',
+    '  projects  scripting/projects              PROJECTS_ROOT',
+    '  inputs    production/inputs               INPUTS_ROOT   (create it yourself; never auto-created)',
+    '  outputs   production/outputs              OUTPUTS_ROOT  (created on demand by production stages)',
+  ].join('\n');
+}
+
 async function main(): Promise<number> {
   const command = String(process.argv[2] ?? '').trim();
+
+  if (command === 'help' || command === '--help' || command === '-h') {
+    console.log(renderUsage());
+    return 0;
+  }
 
   if (command === 'create') {
     const title = arg('--title');
@@ -440,27 +481,7 @@ async function main(): Promise<number> {
     return report.ok ? 0 : 1;
   }
 
-  console.error('Usage: npm run video -- <create|resume|status|approve|publish-status|health|seo|qa|mix-validate>');
-  console.error('  [--title ...] [--project <pipeline.json>] [--only 1,2,3] [--run-flow] [--flow-session] [--yes] [--json]');
-  console.error('  create: [--seo]   # opt-in: also generate the reviewable SEO package for the new story');
-  console.error('  approve: [--candidate <path inside project outputs> --sha256 <expected SHA-256>]');
-  console.error('  seo: --project <pipeline.json> | --project-id <id>');
-  console.error('       [--regenerate] [--extract-only] [--max-attempts 1..5] [--model <name>]');
-  console.error('       [--approve-metadata --yes --by <name>]');
-  console.error('       # writes <project>/seo/ only; never uploads, never calls Zernio/YouTube/R2.');
-  console.error('  qa: --input <media file> [--json]');
-  console.error('      [--target-lufs -14] [--loudness-tolerance 3] [--min-height 720] [--target-height 1080]');
-  console.error('      [--expect-duration <s>] [--duration-tolerance 2] [--black-min 0.5] [--freeze-min 3]');
-  console.error('      [--skip-black] [--skip-freeze] [--skip-audio]');
-  console.error('      # READ-ONLY: black/freeze frames, 16:9 + resolution, clipping, loudness.');
-  console.error('      # Never renders, writes, uploads or publishes; exit 1 only for hard FAIL findings.');
-  console.error('  mix-validate: [--scene N] --input-root <production/inputs/<projectId>> --validation-root <isolated dir>');
-  console.error('                 [--output <file>] [--force] [--max-stretch <x>]');
-  console.error('                 # renders ONE scene; never runs EDIT/MIX-stage/BED/TITLE/APPROVAL,');
-  console.error('                 # never writes production scene outputs or final-assembly media.');
-  console.error('                 # --max-stretch raises the ELIGIBILITY CEILING for this isolated run only.');
-  console.error('                 # Omitted, it stays at the 2.0x policy limit; hard ceiling is 3.0x.');
-  console.error('                 # It never changes the computed duration, the graph, or production behaviour.');
+  console.error(renderUsage());
   return 2;
 }
 
