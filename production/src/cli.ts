@@ -89,6 +89,20 @@ try {
     const pending = remaining();
     await log('pass_complete',{attempt:attempt+1,pending,blocked:blockedItems.length,done:done()});
     if (blockedItems.length > 0) {
+      // A generation block is NOT the external-background dependency: nothing was submitted and the
+      // attempt budget (or the ambiguity gate) refused another paid attempt. Stop with a distinct,
+      // actionable event instead of retrying a refusal for up to six hours.
+      const generationBlocked = blockedItems.filter((item) => String((item as any).blocked?.code ?? '') === 'FLOW_GENERATION_BLOCKED');
+      if (generationBlocked.length > 0) {
+        await log('flow_generation_blocked', {
+          count: generationBlocked.length,
+          code: 'FLOW_GENERATION_BLOCKED',
+          assets: generationBlocked.map((item) => String((item as any).tag ?? (item as any).scene_number ?? '')),
+          denials: generationBlocked.map((item) => String((item as any).blocked?.denial_code ?? '')),
+          hint: 'No credits were spent for the blocked assets. Inspect "npm run video -- flow-attempts --project-id <id>", verify Flow, then set FLOW_APPROVE_GENERATION_RECOVERY=1 or FLOW_APPROVE_GENERATION_RECOVERY_SCENES=<n> (or raise FLOW_MAX_ATTEMPTS_PER_SCENE deliberately).',
+        });
+        break;
+      }
       await log('flow_image_generation_blocked', {
         count: blockedItems.length,
         code: WAITING_FOR_EXTERNAL_BACKGROUND_INPUT,

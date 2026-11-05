@@ -13,6 +13,18 @@ import {
 import { deriveRoutesFromMountedSceneUrl, resolveSceneAttachmentTarget } from './videoDecisions.js';
 import { buildFlowScenePrompt } from './sceneFlowWorkflow.js';
 import { detectWardrobeMode } from './characterWardrobe.js';
+import {
+  beginBoundedGeneration,
+  finishBoundedGeneration,
+  resolveLegacyGenerationLedgerPath,
+  resolveGenerationPolicy,
+  policyFromEnv,
+  approvalFromEnv,
+  type BoundedAttempt,
+  type GenerationApproval,
+  type GenerationPolicy,
+  type GenerationSubject,
+} from './generationAttempts.js';
 
 const isLocked = (item:any): boolean => item?.locked === true;
 
@@ -46,6 +58,57 @@ export interface RunDependencies {
   inputsRoot?: string;
   /** Directory holding cached background PNGs (defaults to `assets/backgrounds`). */
   backgroundsDir?: string;
+  /** Bounded paid-submission policy override (defaults to the environment/defaults). */
+  generationPolicy?: Partial<GenerationPolicy>;
+  /** Explicit operator approval for one automatic recovery attempt. */
+  generationApproval?: GenerationApproval;
+  /** Test seam: an explicit ledger file (defaults to the project's output tree). */
+  generationLedgerFile?: string;
+}
+
+/**
+ * A bounded-attempt refusal. It is NOT a normal failure: `once()` records it as an explicit
+ * `blocked` state so the CLI stops instead of retrying a submission the budget refused.
+ */
+export class GenerationBlockedError extends Error {
+  readonly code = 'FLOW_GENERATION_BLOCKED';
+  constructor(readonly denialCode: string, readonly detailReason: string) {
+    super(`${denialCode}: ${detailReason}`);
+    this.name = 'GenerationBlockedError';
+  }
+}
+
+/**
+ * Reserve exactly ONE paid submission for a legacy asset (character/background/scene) against the
+ * shared persistent ledger. Credit-free validation must already have run; a refusal throws before
+ * any browser action, so no credits are spent.
+ */
+async function beginBoundedAsset(input: {
+  projectId: string;
+  out: string;
+  subject: GenerationSubject;
+  deps: RunDependencies;
+}): Promise<BoundedAttempt> {
+  if (!input.projectId) {
+    throw new GenerationBlockedError('GENERATION_LEDGER_UNRESOLVED', 'the pipeline has no project_id, so no attempt budget can be located.');
+  }
+  const policy = resolveGenerationPolicy({ ...policyFromEnv(), ...(input.deps.generationPolicy ?? {}) });
+  const result = await beginBoundedGeneration({
+    ledgerFile: input.deps.generationLedgerFile ?? resolveLegacyGenerationLedgerPath({ projectId: input.projectId, outputDir: input.out }),
+    projectId: input.projectId,
+    subject: input.subject,
+    policy,
+    approval: input.deps.generationApproval ?? approvalFromEnv(),
+  });
+  if (!result.ok) throw new GenerationBlockedError(result.code, result.reason);
+  return result.handle;
+}
+
+/** Close a reserved legacy attempt; best-effort so persistence can never mask generation truth. */
+async function finishBoundedAsset(handle: BoundedAttempt): Promise<void> {
+  try {
+    await finishBoundedGeneration({ handle, outcome: 'SUCCEEDED', submission: 'SUBMITTED_CONFIRMED' });
+  } catch { /* the attempt stays IN_PROGRESS, which fails closed */ }
 }
 
 /**
@@ -89,7 +152,27 @@ function mark(item:Item,status:'done'|'failed',error?:unknown){ item.status=stat
  * `WAITING_FOR_BACKGROUND` readiness so no parallel state machine is introduced.
  */
 function markBlocked(item:Item,code:string,reason:string|null,detail:string){ item.status='blocked'; item.error=null; (item as any).blocked={ code, reason, detail, readiness:EXTERNAL_BACKGROUND_READINESS }; item.updated_at=new Date().toISOString(); }
-async function once(label:string,item:Item,fn:()=>Promise<void>,p:Pipeline,file:string,log:(e:string,d?:any)=>void,failFast=false){ if(!retryable(item)) return; try { log('start',{label}); await fn(); mark(item,'done'); log('done',{label}); await save(file,p); } catch(e) { mark(item,'failed',e); log('failed',{label,error:String(e)}); await save(file,p); if(failFast) throw e; } }
+/**
+ * Explicit, NON-FAILURE blocked state for a paid submission the attempt budget refused. It is
+ * distinct from a generation failure: nothing was submitted, no credit was spent, and only a human
+ * (or a deliberate policy change) can unblock it.
+ */
+function markGenerationBlocked(item:Item,denialCode:string,reason:string){ item.status='blocked'; item.error=null; (item as any).blocked={ code:'FLOW_GENERATION_BLOCKED', denial_code:denialCode, reason, detail:reason, readiness:'MANUAL_APPROVAL_REQUIRED' }; item.updated_at=new Date().toISOString(); }
+async function once(label:string,item:Item,fn:()=>Promise<void>,p:Pipeline,file:string,log:(e:string,d?:any)=>void,failFast=false){
+  if(!retryable(item)) return;
+  try { log('start',{label}); await fn(); mark(item,'done'); log('done',{label}); await save(file,p); }
+  catch(e) {
+    if (e instanceof GenerationBlockedError) {
+      markGenerationBlocked(item, e.denialCode, e.detailReason);
+      log('generation_blocked',{label,code:e.denialCode,reason:e.detailReason,hint:'Inspect "npm run video -- flow-attempts --project-id <id>"; set FLOW_APPROVE_GENERATION_RECOVERY=1 (or FLOW_APPROVE_GENERATION_RECOVERY_SCENES=<n>) only after checking Flow.'});
+      await save(file,p);
+      if(failFast) throw e;
+      return;
+    }
+    mark(item,'failed',e); log('failed',{label,error:String(e)}); await save(file,p);
+    if(failFast) throw e;
+  }
+}
 
 /**
  * Resolve which assets to process.
@@ -127,7 +210,7 @@ export async function run(flow:FlowClient,page:any,p:Pipeline,file:string,out:st
   const localOf = deps.backgroundLocalState ?? ((item: Item) => resolveLocalBackgroundDefault(item, { projectId, inputsRoot, backgroundsDir }));
 
   // ---- characters (unchanged) ----
-  for(const [i,c] of selection.characters.entries()) await once(`character:${i+1}`,c,async()=>{ const tileName=String(c.tag??c.name); await flow.click(S.addMedia); await flow.click(S.addCharacter); await flow.prompt(String(c.full_prompt)); await flow.generate(); await flow.renameGeneratedCharacter(tileName); await flow.openCharacterDetail(tileName); const look=String(c.look_summary??''); const voice=(c.voice??{}) as any; const gender=voice.gender??(look.match(/\b(female|woman|girl|स्त्री|महिला)\b/i)?'female':'male'); const age=String(voice.age??(look.match(/\b\d{2}\s*(?:year|yr|वर्ष)/i)?.[0]??'')); const descriptor=String(voice.descriptor??(look.match(/(?:region|accent|लहजा|क्षेत्र)[^,.;]*/i)?.[0]??'उत्तर भारतीय लहजा')); await flow.configureVoice({gender,age,descriptor,name:String(c.name??c.tag),voiceName:String(voice.voiceName??c.name??c.tag)}); if (await flow.verifyVoiceApplied(String(voice.voiceName??''))) { (c as any).locked = true; } else { throw new Error(`Character ${tileName} voice verification failed; not locking.`); } },p,file,log,failFast);
+  for(const [i,c] of selection.characters.entries()) await once(`character:${i+1}`,c,async()=>{ const tileName=String(c.tag??c.name); const generationAttempt=await beginBoundedAsset({projectId,out,subject:{kind:'character',id:tileName},deps}); await flow.click(S.addMedia); await flow.click(S.addCharacter); await flow.prompt(String(c.full_prompt)); await flow.generate(); await flow.renameGeneratedCharacter(tileName); await flow.openCharacterDetail(tileName); const look=String(c.look_summary??''); const voice=(c.voice??{}) as any; const gender=voice.gender??(look.match(/\b(female|woman|girl|स्त्री|महिला)\b/i)?'female':'male'); const age=String(voice.age??(look.match(/\b\d{2}\s*(?:year|yr|वर्ष)/i)?.[0]??'')); const descriptor=String(voice.descriptor??(look.match(/(?:region|accent|लहजा|क्षेत्र)[^,.;]*/i)?.[0]??'उत्तर भारतीय लहजा')); await flow.configureVoice({gender,age,descriptor,name:String(c.name??c.tag),voiceName:String(voice.voiceName??c.name??c.tag)}); if (await flow.verifyVoiceApplied(String(voice.voiceName??''))) { (c as any).locked = true; } else { throw new Error(`Character ${tileName} voice verification failed; not locking.`); } await finishBoundedAsset(generationAttempt); },p,file,log,failFast);
 
   // ---- backgrounds (capability-gated) ----
   // NEVER drive the Agentic composer and NEVER call the obsolete ensureImageGenerationMode()
@@ -153,7 +236,7 @@ export async function run(flow:FlowClient,page:any,p:Pipeline,file:string,out:st
       continue;
     }
     // Deterministic Flow still-image generation is available: run the EXISTING sequence.
-    await once(`background:${i+1}`,b,async()=>{ await flow.returnToProjectGrid(); await flow.ensureImageGenerationMode(); await flow.prompt(String(b.full_prompt)); await flow.click(S.aspect16x9); await flow.generateBackground(); await flow.renameGeneratedBackground(String(b.tag??b.location_name)); },p,file,log,failFast);
+    await once(`background:${i+1}`,b,async()=>{ const generationAttempt=await beginBoundedAsset({projectId,out,subject:{kind:'background',id:tag},deps}); await flow.returnToProjectGrid(); await flow.ensureImageGenerationMode(); await flow.prompt(String(b.full_prompt)); await flow.click(S.aspect16x9); await flow.generateBackground(); await flow.renameGeneratedBackground(String(b.tag??b.location_name)); await finishBoundedAsset(generationAttempt); },p,file,log,failFast);
   }
 
   // ---- scenes (unchanged) ----
@@ -189,6 +272,10 @@ export async function run(flow:FlowClient,page:any,p:Pipeline,file:string,out:st
     });
     if(target.kind==='unresolved') throw new Error(`Scene ${s.scene_number} attachment target is not identifiable: ${target.reason}.`);
 
+    // CREDIT GATE: exactly ONE bounded, persistently-tracked paid submission for this scene.
+    // It is the LAST check before the click, so nothing that can fail for free consumes budget.
+    const generationAttempt=await beginBoundedAsset({projectId,out,subject:{kind:'scene',id:String(s.scene_number),sceneNumber:Number(s.scene_number)},deps});
+
     // 2. Project-level video generation from the scene prompt. x1 is enforced inside
     // generateProjectVideo(); it clicks Start exactly once and the title is read from
     // the actual generated video tile - never predicted from the prompt here.
@@ -206,6 +293,8 @@ export async function run(flow:FlowClient,page:any,p:Pipeline,file:string,out:st
     //   · >1 clips → SceneContainsMultipleClipsError (multi-clip is unproven).
     // Identity is always the artifact UUID — never the title, never DOM order.
     await flow.reconcileGeneratedVideoWithScene(generated.title, generated.artifactId);
+    // The paid submission is now proven complete: close the bounded attempt as SUCCEEDED.
+    await finishBoundedAsset(generationAttempt);
 
     // 5. Continue the existing scene pipeline: background/character ingredients are
     // attached through the scene editor picker.

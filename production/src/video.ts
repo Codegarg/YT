@@ -28,6 +28,7 @@ import { getProjectHealth, renderHealthReport } from './projectHealth.js';
 import { planIsolatedSceneMix, runIsolatedSceneMix, parseMaxStretchOverride } from './isolatedSceneMix.js';
 import { MAX_NARRATION_VIDEO_STRETCH } from './narrationDurationPolicy.js';
 import { runMediaQa, renderMediaQaReport } from './mediaQa.js';
+import { generationLedgerPath, readGenerationLedger, renderGenerationHistory } from './generationAttempts.js';
 
 function arg(name: string, fallback?: string): string | undefined { const i = process.argv.indexOf(name); return i >= 0 ? process.argv[i + 1] ?? fallback : fallback; }
 function jsonFlag(): boolean { return process.argv.includes('--json'); }
@@ -185,10 +186,18 @@ function emit(r: WorkflowResult): number {
  */
 export function renderUsage(): string {
   return [
-    'Usage: npm run video -- <create|resume|status|approve|publish-status|health|seo|qa|mix-validate>',
+    'Usage: npm run video -- <create|resume|status|approve|publish-status|health|seo|qa|mix-validate|flow-attempts>',
     '  [--title ...] [--project <pipeline.json>] [--only 1,2,3] [--run-flow] [--flow-session] [--yes] [--json]',
     '  create: [--seo]   # opt-in: also generate the reviewable SEO package for the new story',
     '  approve: [--candidate <path inside project outputs> --sha256 <expected SHA-256>]',
+    '  flow-attempts: --project-id <id> | --project <pipeline.json> [--limit N] [--json]',
+    '       # READ-ONLY: per-scene/asset attempt budget, failure category, submission state,',
+    '       # manual-approval state and the recent attempt history from',
+    '       # <outputsRoot>/<projectId>/flow-scenes/generation-attempts.json.',
+    '  resume|create: [--approve-generation-recovery --yes]',
+    '       [--approve-generation-recovery-scenes 3,7]',
+    '       # Grants ONE extra attempt that the bounded budget/ambiguity gate refused.',
+    '       # It never raises a ceiling; raise FLOW_MAX_ATTEMPTS_PER_SCENE deliberately.',
     '  seo: --project <pipeline.json> | --project-id <id>',
     '       [--regenerate] [--extract-only] [--max-attempts 1..5] [--model <name>]',
     '       [--approve-metadata --yes --by <name>]',
@@ -220,6 +229,47 @@ async function main(): Promise<number> {
 
   if (command === 'help' || command === '--help' || command === '-h') {
     console.log(renderUsage());
+    return 0;
+  }
+
+  // EXPLICIT recovery approval. It is opt-in per invocation, requires --yes, and only ever grants
+  // ONE extra attempt that the bounded budget/ambiguity gate refused — never a raised ceiling.
+  if (hasFlag('--approve-generation-recovery-scenes') && !hasFlag('--approve-generation-recovery')) {
+    console.error('--approve-generation-recovery-scenes requires --approve-generation-recovery (and --yes).');
+    return 2;
+  }
+  if (hasFlag('--approve-generation-recovery')) {
+    if (!hasFlag('--yes')) {
+      console.error('--approve-generation-recovery requires explicit --yes (it authorises a paid Flow recovery attempt).');
+      console.error('Inspect the attempt history first: npm run video -- flow-attempts --project-id <id>');
+      return 2;
+    }
+    const scenes = String(arg('--approve-generation-recovery-scenes') ?? '').trim();
+    if (scenes) process.env.FLOW_APPROVE_GENERATION_RECOVERY_SCENES = scenes;
+    else process.env.FLOW_APPROVE_GENERATION_RECOVERY = '1';
+    console.error('generation recovery approval granted for this invocation only.');
+  }
+
+  if (command === 'flow-attempts') {
+    const projectId = arg('--project-id') ?? projectIdFromProjectArg();
+    if (!projectId) { console.error('video flow-attempts requires --project-id <id> or --project <pipeline.json>.'); return 2; }
+    const ledgerFile = generationLedgerPath({ projectId, outputsRoot: OUTPUTS_ROOT });
+    const read = await readGenerationLedger(ledgerFile, { projectId });
+    if (!read.ok) {
+      // READ-ONLY and fail-closed: an unreadable ledger is never silently reset here.
+      console.error(`video flow-attempts: the ledger at ${ledgerFile} is unreadable (${read.reason}).`);
+      console.error('Nothing was changed. Inspect the file; to operate under explicit approval run a real command with --approve-generation-recovery --yes, which quarantines the corrupt file first.');
+      return 1;
+    }
+    if (!read.exists || !read.ledger) {
+      if (jsonFlag()) console.log(JSON.stringify({ projectId, ledgerFile, exists: false, ledger: null }, null, 2));
+      else console.log(`no generation attempts recorded for ${projectId}\n  ledger: ${ledgerFile}`);
+      return 0;
+    }
+    const limitRaw = Number(arg('--limit') ?? 20);
+    const limit = Number.isInteger(limitRaw) && limitRaw > 0 ? limitRaw : 20;
+    if (jsonFlag()) console.log(JSON.stringify({ projectId, ledgerFile, exists: true, ledger: read.ledger }, null, 2));
+    else console.log(renderGenerationHistory(read.ledger, { limit }));
     return 0;
   }
 

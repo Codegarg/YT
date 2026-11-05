@@ -340,6 +340,27 @@ directory; a relative value is ignored there to avoid creating `scripting/script
 | `FLOW_DOWNLOAD_DIR` | `%USERPROFILE%\Downloads` | Flow clip downloads |
 | `FLOW_LOGIN_TIMEOUT_MS` | `600000` (minimum 60000) | `npm run flow` sign-in wait |
 
+### Bounded generation attempts (credit safety)
+
+All values are optional; invalid values fall back to the conservative default rather than
+disabling the budget. The ledger lives at
+`<OUTPUTS_ROOT>/<project-id>/flow-scenes/generation-attempts.json`.
+
+| Variable | Default | Read by |
+|---|---|---|
+| `FLOW_MAX_ATTEMPTS_PER_SCENE` | `2` | every scene generation path (project composer + scene-local lifecycle) |
+| `FLOW_MAX_ATTEMPTS_PER_ASSET` | `2` | legacy `npm run flow` characters/backgrounds |
+| `FLOW_MAX_ATTEMPTS_PER_PROJECT` | `80` | all generation paths (project ceiling) |
+| `FLOW_MAX_CONSECUTIVE_FAILURES` | `2` | automatic-retry stop |
+| `FLOW_ATTEMPT_LOCK_STALE_MINUTES` | `30` | age after which an abandoned in-progress attempt stops blocking a concurrent run |
+| `FLOW_REQUIRE_APPROVAL_AFTER_AMBIGUOUS` | `1` | recorded for operators; an ambiguous submission always fails closed |
+| `FLOW_APPROVE_GENERATION_RECOVERY` | unset | one-shot project-wide recovery approval (`1`) |
+| `FLOW_APPROVE_GENERATION_RECOVERY_SCENES` | unset | one-shot scene-scoped recovery approval (`3,7`) |
+
+Prefer the CLI flag over exporting these: `--approve-generation-recovery --yes` (optionally with
+`--approve-generation-recovery-scenes 3,7`) applies the approval to that invocation only. See
+[`GENERATION_SAFETY.md`](GENERATION_SAFETY.md) for the full procedure.
+
 ### Providers, publishing and retries
 
 See §6.2. `ZERNIO_API_KEY`, R2 and Freesound values are only read by their own commands, and are

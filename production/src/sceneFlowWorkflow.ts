@@ -32,6 +32,22 @@ import {
 } from './sceneGenerationPolicy.js';
 import { hardenFlowPrompt, findResidualMachineIds, type CanonicalBackground, type CanonicalCharacter } from './flowPromptHardening.js';
 import {
+  beginBoundedGeneration,
+  finishBoundedGeneration,
+  releaseBoundedGeneration,
+  classifyGenerationFailure,
+  createSubmissionProbe,
+  generationLedgerPath,
+  policyFromEnv,
+  approvalFromEnv,
+  resolveGenerationPolicy,
+  type BoundedAttempt,
+  type FailureCategory,
+  type GenerationApproval,
+  type GenerationPolicy,
+  type SubmissionState,
+} from './generationAttempts.js';
+import {
   CHARACTER_LOCKS_HEADER,
   WARDROBE_CONTINUITY_RESTRAINTS,
   buildCharacterLockBlock,
@@ -61,7 +77,9 @@ export type SceneWorkflowStatus =
   | 'SCENE_LOCAL_EXTENSION_COMPLETE'
   | 'SCENE_LOCAL_REGENERATE_COMPLETE'
   | 'SCENE_LOCAL_GENERATION_FAILED'
-  | 'SCENE_LOCAL_BLOCKED';
+  | 'SCENE_LOCAL_BLOCKED'
+  /** The bounded attempt budget (or the manual-approval gate) refused another paid submission. */
+  | 'FLOW_GENERATION_BLOCKED';
 
 export interface SceneCheckpoint {
   schema_version: number;
@@ -241,6 +259,17 @@ export interface ProcessSceneConfig {
    * `allowGeneration`, scene existence, a URL, or a committed clip.
    */
   sceneLocalAuthorization?: SceneLocalAuthorization | null;
+  /**
+   * Bounded-attempt policy for paid Flow submissions (PHASE-2). Omitted values come from the
+   * environment (`FLOW_MAX_ATTEMPTS_*`); the conservative defaults apply when nothing is set.
+   */
+  generationPolicy?: Partial<GenerationPolicy> | null;
+  /**
+   * Explicit operator approval for ONE recovery attempt that the ledger would otherwise refuse
+   * (ambiguous/unknown submission, crash recovery, non-retryable failure, exhausted consecutive
+   * failures). It never raises a ceiling — raise the policy instead.
+   */
+  generationApproval?: GenerationApproval | null;
 }
 
 /**
@@ -528,6 +557,26 @@ async function readAuthorizedSceneEvidence(
 }
 
 /**
+ * Reserve ONE paid submission for a scene against the shared persistent ledger.
+ *
+ * All credit-free validation is expected to have run before this is called; the reservation happens
+ * only when the scene is genuinely about to submit. A denial is fail-closed and writes nothing.
+ */
+export async function beginSceneGenerationAttempt(
+  config: ProcessSceneConfig,
+  sceneNumber: number,
+) {
+  const policy = resolveGenerationPolicy({ ...policyFromEnv(), ...(config.generationPolicy ?? {}) });
+  return beginBoundedGeneration({
+    ledgerFile: generationLedgerPath({ projectId: config.projectId, outputsRoot: config.outputsRoot ?? 'outputs' }),
+    projectId: config.projectId,
+    subject: { kind: 'scene', id: String(sceneNumber), sceneNumber },
+    policy,
+    approval: config.generationApproval ?? approvalFromEnv(),
+  });
+}
+
+/**
  * Process EXACTLY ONE scene. `flow` is the existing FlowClient (or a compatible stub in tests).
  * Generation is opt-in and capped at ONE attempt; everything else is idempotent.
  */
@@ -631,10 +680,20 @@ export async function processSingleFlowScene(
       return sceneLocalBlocked(base, 'SCENE_STATE_AMBIGUOUS', 'scene-local policy authorized generation without PRESENT committed evidence.');
     }
 
+    // The lifecycle is now one click away from a paid submission: reserve it against the SAME
+    // persistent budget the project-composer path uses. A refusal stops before any browser work.
+    const attempt = await beginSceneGenerationAttempt(config, sceneNumber);
+    if (!attempt.ok) {
+      return sceneLocalBlocked(base, 'GENERATION_BLOCKED', `${attempt.code}: ${attempt.reason}`);
+    }
+    const handle: BoundedAttempt = attempt.handle;
+    const probe = createSubmissionProbe(flow);
+
     let port: ReturnType<typeof createFlowSceneLifecyclePort>;
     try {
       port = createFlowSceneLifecyclePort(flow, { assetVerificationSceneId: validated.authorization.targetSceneId });
     } catch (e: any) {
+      await releaseBoundedGeneration({ handle, reason: 'the scene-local lifecycle port could not be built before any submission.' });
       return sceneLocalBlocked(base, 'SCENE_LOCAL_UNAVAILABLE', `scene-local lifecycle port could not be built: ${String(e?.message ?? e).slice(0, 200)}`);
     }
 
@@ -665,16 +724,28 @@ export async function processSingleFlowScene(
         downloadOptions: { ffprobePath: config.ffprobePath, downloadDir: config.downloadDir },
       });
     } catch (e: any) {
-      return { ...base, status: 'SCENE_LOCAL_GENERATION_FAILED', detail: String(e?.message ?? e).slice(0, 260) };
+      const detail = String(e?.message ?? e).slice(0, 260);
+      const classification = classifyGenerationFailure({ error: e, submitted: probe.read() });
+      await finishBoundedGeneration({ handle, outcome: 'FAILED', category: classification.category, submission: classification.submission, reason: detail });
+      return { ...base, status: 'SCENE_LOCAL_GENERATION_FAILED', detail };
     }
 
     const generationAttempts = lifecycle.phases.includes('GENERATE') ? 1 : 0;
     if (!lifecycle.ok) {
+      const detail = `${lifecycle.code ?? 'FAILED'}@${lifecycle.phase ?? '-'}: ${String(lifecycle.reason ?? 'scene-local lifecycle failed').slice(0, 220)}`;
+      const submitted = probe.read();
+      if (!lifecycle.phases.includes('GENERATE') && submitted === false) {
+        // Proven no-submit: the budget is untouched, exactly as if the attempt never happened.
+        await releaseBoundedGeneration({ handle, reason: detail });
+      } else {
+        const classification = classifyGenerationFailure({ error: detail, submitted });
+        await finishBoundedGeneration({ handle, outcome: 'FAILED', category: classification.category, submission: classification.submission, reason: detail });
+      }
       return {
         ...base,
         status: 'SCENE_LOCAL_GENERATION_FAILED',
         generationAttempts,
-        detail: `${lifecycle.code ?? 'FAILED'}@${lifecycle.phase ?? '-'}: ${String(lifecycle.reason ?? 'scene-local lifecycle failed').slice(0, 220)}`,
+        detail,
       };
     }
 
@@ -682,6 +753,13 @@ export async function processSingleFlowScene(
     // so the checkpoint and the workflow result are both derived from the file on disk.
     const localMeta = await validateVideoClip(dest, { ffprobePath: config.ffprobePath });
     if (localMeta.state !== 'VALID') {
+      await finishBoundedGeneration({
+        handle,
+        outcome: 'FAILED',
+        category: 'UNKNOWN',
+        submission: 'SUBMITTED_CONFIRMED',
+        reason: `downloaded scene-local clip is ${localMeta.state}`,
+      });
       return { ...base, status: 'SCENE_LOCAL_GENERATION_FAILED', generationAttempts, detail: `downloaded scene-local clip is ${localMeta.state}: ${String(localMeta.reason ?? '').slice(0, 180)}` };
     }
 
@@ -702,6 +780,14 @@ export async function processSingleFlowScene(
       audio_codec: localMeta.audio?.codec ?? null,
       workflow_status: 'DOWNLOAD_SUCCESS',
       updated_at: new Date().toISOString(),
+    });
+
+    await finishBoundedGeneration({
+      handle,
+      outcome: 'SUCCEEDED',
+      submission: 'SUBMITTED_CONFIRMED',
+      clipDownloaded: true,
+      validationPassed: true,
     });
 
     return {
@@ -806,45 +892,82 @@ export async function processSingleFlowScene(
     return { ...base, status: 'FLOW_SCENE_ALREADY_COMMITTED', localClipPath: dest, sha256: meta0.sha256 ?? null, durationSeconds: meta0.durationSeconds, width: meta0.video?.width, height: meta0.video?.height, videoCodec: meta0.video?.codec, audioCodec: meta0.audio?.codec, downloads: 1 };
   }
 
-  // GENERATE path: exactly ONE attempt, only when explicitly authorised.
-  let generationAttempts = 1;
+  // GENERATE path: exactly ONE paid submission, reserved against the persistent attempt budget.
+  const generationAttempts = 1;
   let generated: { title: string; artifactId: string } | null = null;
-  try {
-    const narrator = scene?.speaker === 'NARRATOR' || scene?.speaker === 'none';
-    // Field name is `animation_prompt_WITH_lipsync` (lowercase `sync`) — matches runner.ts.
-    const prompt = String((narrator ? scene?.animation_prompt_NARRATOR_ONLY : scene?.animation_prompt_WITH_lipsync) ?? '').trim();
-    if (!prompt) return { ...base, status: 'INPUT_INVALID', detail: 'The scene has no animation prompt to generate from.' };
-    // Resolve every machine identifier into its canonical human description and append the
-    // explicit output restraints BEFORE submitting. Submitting the raw manifest prompt is what
-    // caused Flow to render "@CHAR-03-RADHADEVI-ATMA" as a burned-in caption (see
-    // FLOW_OUTPUT_RESTRAINTS). Fails closed, so a defective prompt costs zero credits.
-    const built = buildFlowScenePrompt({
-      prompt,
-      backgrounds: config.backgrounds ?? null,
-      characters: config.characters ?? null,
-      scene,
-      wardrobeMode: config.wardrobeMode,
+
+  const narrator = scene?.speaker === 'NARRATOR' || scene?.speaker === 'none';
+  // Field name is `animation_prompt_WITH_lipsync` (lowercase `sync`) — matches runner.ts.
+  const prompt = String((narrator ? scene?.animation_prompt_NARRATOR_ONLY : scene?.animation_prompt_WITH_lipsync) ?? '').trim();
+  if (!prompt) return { ...base, status: 'INPUT_INVALID', detail: 'The scene has no animation prompt to generate from.' };
+  // Resolve every machine identifier into its canonical human description and append the
+  // explicit output restraints BEFORE submitting. Submitting the raw manifest prompt is what
+  // caused Flow to render "@CHAR-03-RADHADEVI-ATMA" as a burned-in caption (see
+  // FLOW_OUTPUT_RESTRAINTS). Fails closed, so a defective prompt costs zero credits.
+  const built = buildFlowScenePrompt({
+    prompt,
+    backgrounds: config.backgrounds ?? null,
+    characters: config.characters ?? null,
+    scene,
+    wardrobeMode: config.wardrobeMode,
+  });
+  if (!built.ok) return { ...base, status: 'INPUT_INVALID', detail: built.reason.slice(0, 200) };
+
+  // Every credit-free check has passed. Reserve the attempt IMMEDIATELY before the submission so a
+  // refusal cannot consume budget and a crash leaves a durable IN_PROGRESS marker that fails closed.
+  const attempt = await beginSceneGenerationAttempt(config, sceneNumber);
+  if (!attempt.ok) {
+    return {
+      ...base,
+      status: 'FLOW_GENERATION_BLOCKED',
+      detail: `${attempt.code}: ${attempt.reason}`,
+    };
+  }
+  const handle: BoundedAttempt = attempt.handle;
+  const probe = createSubmissionProbe(flow);
+
+  /** Close the reserved attempt exactly once, recording what really happened. */
+  const closeAttempt = async (
+    outcome: 'SUCCEEDED' | 'FAILED',
+    detail: string | null,
+    opts: { category?: FailureCategory; submission?: SubmissionState; clipDownloaded?: boolean; validationPassed?: boolean } = {},
+  ): Promise<void> => {
+    await finishBoundedGeneration({
+      handle,
+      outcome,
+      category: outcome === 'SUCCEEDED' ? 'NONE' : (opts.category ?? 'UNKNOWN'),
+      submission: opts.submission ?? (outcome === 'SUCCEEDED' ? 'SUBMITTED_CONFIRMED' : 'SUBMISSION_UNKNOWN'),
+      reason: detail,
+      clipDownloaded: opts.clipDownloaded === true,
+      validationPassed: opts.validationPassed === true,
     });
-    if (!built.ok) return { ...base, status: 'INPUT_INVALID', detail: built.reason.slice(0, 200) };
+  };
+
+  try {
     generated = await flow.generateProjectVideo(built.prompt);
   } catch (e: any) {
+    const detail = String(e?.message ?? e).slice(0, 200);
+    const classification = classifyGenerationFailure({ error: e, submitted: probe.read() });
+    await closeAttempt('FAILED', detail, { category: classification.category, submission: classification.submission });
     await writeSceneCheckpoint(checkpointPath, {
       schema_version: SCENE_CHECKPOINT_SCHEMA_VERSION, project_id: config.projectId, scene_number: sceneNumber,
       flow_scene_id: scene?.flow_scene_id ?? null, flow_scene_url: scene?.flow_scene_url ?? null, generation_uuid: null,
       local_clip_path: null, local_clip_sha256: null, duration_seconds: null, width: null, height: null,
       video_codec: null, audio_codec: null, workflow_status: 'FLOW_GENERATION_FAILED', updated_at: new Date().toISOString(),
     });
-    return { ...base, status: 'FLOW_GENERATION_FAILED', generationAttempts, detail: String(e?.message ?? e).slice(0, 200) };
+    return { ...base, status: 'FLOW_GENERATION_FAILED', generationAttempts, detail };
   }
 
   // Commit verification: generation success ≠ committed.
   const precedence = decideCommitPrecedence(false, generated?.artifactId);
   if (precedence !== 'GENERATED') {
+    await closeAttempt('FAILED', 'No generated artifact id was returned.', { category: 'UNKNOWN', submission: 'SUBMITTED_CONFIRMED' });
     return { ...base, status: 'FLOW_COMMIT_NOT_PROVEN', generationAttempts, detail: 'No generated artifact id was returned.' };
   }
   let nowCommitted = false;
   if (flow?.sceneHasClip) nowCommitted = await flow.sceneHasClip().catch(() => false);
   if (!nowCommitted) {
+    await closeAttempt('FAILED', `Generated ${generated!.artifactId} but the scene did not commit a clip.`, { category: 'UNKNOWN', submission: 'SUBMITTED_CONFIRMED' });
     await writeSceneCheckpoint(checkpointPath, {
       schema_version: SCENE_CHECKPOINT_SCHEMA_VERSION, project_id: config.projectId, scene_number: sceneNumber,
       flow_scene_id: scene?.flow_scene_id ?? null, flow_scene_url: scene?.flow_scene_url ?? null, generation_uuid: generated!.artifactId,
@@ -856,11 +979,14 @@ export async function processSingleFlowScene(
 
   // DOWNLOAD via the proven 8EI implementation (never duplicated here).
   if (typeof flow.downloadCommittedSceneClip !== 'function') {
+    await closeAttempt('FAILED', 'The Flow client does not expose downloadCommittedSceneClip.', { category: 'UNKNOWN', submission: 'SUBMITTED_CONFIRMED' });
     return { ...base, status: 'DOWNLOAD_FAILED', generationAttempts, detail: 'The Flow client does not expose downloadCommittedSceneClip.' };
   }
   const dl = await flow.downloadCommittedSceneClip(sceneNumber, dest, { ffprobePath: config.ffprobePath, downloadDir: config.downloadDir });
   if (!dl?.ok) {
-    return { ...base, status: 'DOWNLOAD_FAILED', generationAttempts, detail: String(dl?.reason ?? dl?.result ?? 'download failed').slice(0, 200) };
+    const detail = String(dl?.reason ?? dl?.result ?? 'download failed').slice(0, 200);
+    await closeAttempt('FAILED', detail, { category: 'RETRYABLE', submission: 'SUBMITTED_CONFIRMED' });
+    return { ...base, status: 'DOWNLOAD_FAILED', generationAttempts, detail };
   }
   const meta = await validateVideoClip(dest, { ffprobePath: config.ffprobePath });
   await writeSceneCheckpoint(checkpointPath, {
@@ -871,6 +997,11 @@ export async function processSingleFlowScene(
     video_codec: meta.video?.codec ?? null, audio_codec: meta.audio?.codec ?? null,
     ...(await committedField()),
     workflow_status: 'DOWNLOAD_SUCCESS', updated_at: new Date().toISOString(),
+  });
+  await closeAttempt('SUCCEEDED', null, {
+    submission: 'SUBMITTED_CONFIRMED',
+    clipDownloaded: true,
+    validationPassed: meta.state === 'VALID',
   });
   return { ...base, status: 'DOWNLOAD_SUCCESS', localClipPath: dest, sha256: meta.sha256 ?? null, durationSeconds: meta.durationSeconds, width: meta.video?.width, height: meta.video?.height, videoCodec: meta.video?.codec, audioCodec: meta.audio?.codec, generationAttempts, downloads: 1 };
 }

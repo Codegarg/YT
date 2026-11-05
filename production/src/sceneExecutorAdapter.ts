@@ -34,6 +34,7 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { processSingleFlowScene, sceneCheckpointPath, readSceneCheckpoint, type ProcessSceneConfig, type ProcessSceneResult } from './sceneFlowWorkflow.js';
 import type { SceneLocalAuthorization } from './sceneGenerationPolicy.js';
+import type { GenerationApproval, GenerationPolicy } from './generationAttempts.js';
 import { detectWardrobeMode } from './characterWardrobe.js';
 import { renderScene } from './sceneRenderer.js';
 import { motionFromSceneText, sceneClipFilename } from './sceneRender.js';
@@ -60,6 +61,10 @@ export interface CreateRealSceneExecutorOptions {
    * verbatim to the workflow and is never inferred here. Absent/null keeps the legacy path.
    */
   sceneLocalAuthorization?: SceneLocalAuthorization | null;
+  /** Bounded paid-submission policy forwarded to the workflow (defaults to env/defaults). */
+  generationPolicy?: Partial<GenerationPolicy>;
+  /** Explicit operator approval for one recovery attempt (defaults to the env approval surface). */
+  generationApproval?: GenerationApproval;
   ffprobePath?: string;
   /** FFmpeg executable for the existing LOCAL_SYNTHESIS renderer (defaults to PATH/env). */
   ffmpegPath?: string;
@@ -360,6 +365,8 @@ export function createRealSceneExecutor(opts: CreateRealSceneExecutorOptions): S
       characters: (opts.pipeline as any)?.characters ?? null,
       wardrobeMode: detectWardrobeMode(opts.pipeline),
       sceneLocalAuthorization: opts.sceneLocalAuthorization ?? null,
+      generationPolicy: opts.generationPolicy,
+      generationApproval: opts.generationApproval,
     };
     let result: ProcessSceneResult;
     try {
@@ -372,7 +379,7 @@ export function createRealSceneExecutor(opts: CreateRealSceneExecutorOptions): S
     if (!isSceneWorkflowSuccess(result.status) || !result.localClipPath) {
       // Distinguish "needs Flow but no client" (fail closed, recovery/generation required) from a
       // genuine workflow failure. Both are non-success; neither is ever reported as executed.
-      const needsFlow = result.status === 'FLOW_GENERATION_REQUIRED' || result.status === 'FLOW_GENERATION_FAILED' || result.status === 'DOWNLOAD_FAILED' || result.status === 'FLOW_COMMIT_NOT_PROVEN' || result.status === 'FLOW_SCENE_NOT_COMMITTED' || result.status === 'SCENE_LOCAL_GENERATION_FAILED' || result.status === 'SCENE_LOCAL_BLOCKED';
+      const needsFlow = result.status === 'FLOW_GENERATION_REQUIRED' || result.status === 'FLOW_GENERATION_FAILED' || result.status === 'FLOW_GENERATION_BLOCKED' || result.status === 'DOWNLOAD_FAILED' || result.status === 'FLOW_COMMIT_NOT_PROVEN' || result.status === 'FLOW_SCENE_NOT_COMMITTED' || result.status === 'SCENE_LOCAL_GENERATION_FAILED' || result.status === 'SCENE_LOCAL_BLOCKED';
       const suffix = !flow && needsFlow ? ' (no Flow client available for this run)' : '';
       return { ok: false, reason: `Scene ${n} not produced: ${result.status}${result.detail ? ` (${result.detail})` : ''}${suffix}` };
     }

@@ -349,7 +349,35 @@ export class FlowClient {
    * scene can reuse Flow's stale pre-attachment empty view — live 8AP).
    */
   private projectUrl = '';
+  /**
+   * MONOTONIC submission latch (PHASE-2 credit safety). It records — as observed fact — that a
+   * paid generate control was pressed, and NEVER resets for the lifetime of the client. The
+   * bounded-attempt ledger reads it through `getGenerationSubmissionState()` to distinguish
+   * "definitely not submitted" from "submitted" / "cannot know". Guessing from error text is
+   * explicitly not allowed: a browser timeout may hide a click that already landed.
+   */
+  private generationSubmission: { submitted: boolean; at: string | null } = { submitted: false, at: null };
   constructor(private page:Page, private log:(e:string,d?:any)=>void) {}
+
+  /**
+   * Record that a paid generation control was clicked. `at` is forced strictly increasing, so two
+   * submissions inside the same millisecond are still distinguishable by a before/after probe.
+   */
+  private noteGenerationSubmission(): void {
+    const now = Date.now();
+    const previous = this.generationSubmission.at ? Date.parse(this.generationSubmission.at) : NaN;
+    const at = Number.isFinite(previous) && now <= previous ? previous + 1 : now;
+    this.generationSubmission = { submitted: true, at: new Date(at).toISOString() };
+    this.log('flow_generation_submitted', { at: this.generationSubmission.at });
+  }
+
+  /**
+   * READ-ONLY observation for the attempt ledger: has THIS client pressed a paid generate control,
+   * and when was the most recent press? `submitted === true` means credits may already be spent.
+   */
+  getGenerationSubmissionState(): { submitted: boolean; at: string | null } {
+    return { submitted: this.generationSubmission.submitted, at: this.generationSubmission.at };
+  }
   async first(candidates: readonly string[], timeout=15000) { for (const s of candidates) { const l=this.page.locator(s).first(); try { await l.waitFor({state:'visible',timeout}); return l; } catch {} } throw new Error(`Selector not found: ${candidates.join(' | ')}`); }
   async click(candidates:readonly string[]) { await (await this.first(candidates)).click(); }
   async fill(candidates:readonly string[], text:string) { const l=await this.first(candidates); await l.fill(text); }
@@ -430,9 +458,9 @@ export class FlowClient {
     return String((result as any).dataUrl);
   }
 
-  async generateBackground() { await this.waitForGenerationReady(); await this.click(S.submit); await this.waitForBackgroundComplete(); }
+  async generateBackground() { await this.waitForGenerationReady(); await this.click(S.submit); this.noteGenerationSubmission(); await this.waitForBackgroundComplete(); }
   async prompt(text:string) { await this.fill(S.promptInput,text); }
-  async generate() { await this.waitForGenerationReady(); await this.click(S.submit); await this.waitComplete(); }
+  async generate() { await this.waitForGenerationReady(); await this.click(S.submit); this.noteGenerationSubmission(); await this.waitComplete(); }
   // Deterministic readiness gate before clicking Start generation: the prompt
   // editor is present, the transient Add-media menu backdrop is gone, and the
   // submit control is visible and enabled (i.e. the prompt registered).
@@ -2002,6 +2030,7 @@ export class FlowClient {
     // impossible, independent of control flow.
     startGate.armed = false;
     await this.click(S.submit);
+    this.noteGenerationSubmission();
     startGate.armed = true;   // Start has been clicked exactly once; AFTER polling may begin.
 
     // 9. Bounded polling on the SAME un-navigated generation surface (STEP-8Q):
@@ -3267,6 +3296,7 @@ export class FlowClient {
     // delta can only ever be evaluated once `armed` is true, which happens after the single click.
     startGate.armed = false;
     await start.click();
+    this.noteGenerationSubmission();
     startGate.armed = true;   // Start has been clicked exactly once; AFTER polling may begin.
 
     // Bounded auxiliary wait for the composer's own completion signal. It is NOT the identity
@@ -3422,6 +3452,7 @@ export class FlowClient {
     //     object-returning `listProjectVideos()` is deliberately NOT used for identity.
     const beforeIds = await this.readGenerationSurfaceArtifactIds().catch(() => [] as string[]);
     await gen.click();
+    this.noteGenerationSubmission();
     await this.waitComplete(600000);
     const afterIds = await this.readGenerationSurfaceArtifactIds().catch(() => [] as string[]);
     const delta = newArtifactIds(beforeIds, afterIds);

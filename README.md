@@ -142,7 +142,7 @@ npm ci
 npm run flow -- --project ..\scripting\projects\village-well\pipeline.json --user-data-dir .\chrome-profile --output-dir .\outputs
 ```
 
-The runner uses a persistent Chromium profile. On first use, complete Google login in the opened browser, then rerun. UI labels/selectors are centralized in `production/src/selectors.ts` and can be updated when Flow changes. It waits on DOM state and download events, not fixed render sleeps. The runner skips `done`, retries each `failed` item once, logs structured errors, and continues with later items.
+The runner uses a persistent Chromium profile. On first use, complete Google login in the opened browser, then rerun. UI labels/selectors are centralized in `production/src/selectors.ts` and can be updated when Flow changes. It waits on DOM state and download events, not fixed render sleeps. The runner skips `done` items and records every paid submission in a persistent attempt ledger before clicking, so a failed/ambiguous generation can never be retried without bound (see [Bounded generation attempts](#bounded-generation-attempts-credit-safety) below).
 
 This automation is intentionally conservative: it does not call a Flow API, create accounts, acquire credits, or clone voices.
 
@@ -155,6 +155,44 @@ This automation is intentionally conservative: it does not call a Flow API, crea
 > (`production/inputs/<project-id>/backgrounds/<tag>.png`) and **cached** backgrounds are reused
 > as-is. To re-enable Flow background generation later, implement the deterministic capability
 > in `flowCapabilities.ts` only; runner orchestration does not change.
+
+### Bounded generation attempts (credit safety)
+
+Every path that can press a paid Flow generate control — the project composer scene path, the
+explicit scene-local extend/regenerate lifecycle, and the legacy `npm run flow` character /
+background / scene loops — reserves the attempt in one persistent ledger **before** the click:
+
+```text
+<OUTPUTS_ROOT>/<project-id>/flow-scenes/generation-attempts.json
+```
+
+The ledger is project data (atomic JSON, no cookies/tokens/prompts). It records the attempt id and
+number, timestamps, failure category, whether submission was confirmed, whether the clip was
+downloaded and validated, whether a retry is permitted, and the manual-approval state. A restart
+re-reads the same counters, so **resuming never resets a budget**.
+
+Inspect it read-only at any time:
+
+```powershell
+cd production
+npm run video -- flow-attempts --project-id <project-id>
+npm run video -- flow-attempts --project-id <project-id> --json
+```
+
+Defaults: 2 attempts per scene, 2 per asset, 80 per project, stop after 2 consecutive failures, and
+any ambiguous submission stops for a human. Only a failure **proven not to have submitted** (the
+FlowClient submission latch) and classified as transient retries automatically. An ambiguous
+(UNKNOWN) outcome, a crash/`IN_PROGRESS` attempt, or a permanent failure requires explicit recovery
+approval, which grants **one** more attempt and never raises a ceiling:
+
+```powershell
+npm run video -- resume --project <pipeline.json> --run-flow --flow-session --approve-generation-recovery --yes
+# or scope the approval to specific scenes (comma-separated):
+npm run video -- resume --project <pipeline.json> --run-flow --flow-session --approve-generation-recovery --approve-generation-recovery-scenes 3,7 --yes
+```
+
+The full procedure (failure categories, resume steps, corrupt-ledger handling, how to read the
+history) is in [`docs/GENERATION_SAFETY.md`](docs/GENERATION_SAFETY.md).
 
 ### Final edit with natural clip lengths and fades
 
@@ -394,6 +432,17 @@ FLOW_USER_DATA_DIR=
 FLOW_BROWSER_CHANNEL=chrome
 FLOW_DOWNLOAD_DIR=
 FLOW_LOGIN_TIMEOUT_MS=600000
+
+# Bounded generation attempts (credit safety; defaults shown)
+FLOW_MAX_ATTEMPTS_PER_SCENE=2
+FLOW_MAX_ATTEMPTS_PER_ASSET=2
+FLOW_MAX_ATTEMPTS_PER_PROJECT=80
+FLOW_MAX_CONSECUTIVE_FAILURES=2
+FLOW_ATTEMPT_LOCK_STALE_MINUTES=30
+FLOW_REQUIRE_APPROVAL_AFTER_AMBIGUOUS=1
+# One-shot recovery approval (prefer --approve-generation-recovery --yes, never persist these):
+# FLOW_APPROVE_GENERATION_RECOVERY=1
+# FLOW_APPROVE_GENERATION_RECOVERY_SCENES=3,7
 
 # Tools and runtime locations
 FFMPEG_PATH=
