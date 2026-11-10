@@ -38,6 +38,13 @@ import { classifyFlowNeeds } from './flowRunnerAdapter.js';
 import { evaluateApproval, loadApproval, approvalRecordPath, type ApprovalRecord } from './approval.js';
 import type { DownstreamStage, StageExecutor, StageExecutionResult } from './downstreamStages.js';
 import type { SceneLocalAuthorization } from './sceneGenerationPolicy.js';
+import {
+  decideStoryGate,
+  renderStoryReport,
+  type StoryGateDecision,
+  type StoryValidator,
+  type StoryValidationResult,
+} from './storyValidation.js';
 
 // ---------------------------------------------------------------------------------------
 // Workflow phases (reporting only — state.json stays authoritative)
@@ -77,6 +84,13 @@ export interface WorkflowResult {
   scope?: { scenes: number[]; executed: number[]; failed: number[] };
   /** Durable approval verdict (STEP-8GV). Never causes an automatic approval. */
   approval?: { status: 'APPROVED' | 'NOT_APPROVED' | 'STALE_APPROVAL'; record?: ApprovalRecord; finalOutputHash?: string; reason?: string };
+  /**
+   * PHASE 3 read-only story/scene audit. Present when a `storyValidator` boundary was injected;
+   * it reports findings WITHOUT mutating the project or any generation artefact.
+   */
+  storyValidation?: StoryValidationResult;
+  /** The gate decision derived from `storyValidation` (absent when no validator ran). */
+  storyGate?: StoryGateDecision;
   /** Reason for a hard failure (malformed pipeline, generator failure, collision). */
   reason?: string;
 }
@@ -182,6 +196,18 @@ export interface WorkflowOptions {
    * marks the whole project complete. Absent ⇒ full-project behavior (unchanged).
    */
   only?: number[];
+  /**
+   * PHASE 3 boundary: READ-ONLY story & scene validation (never writes, never spends credits).
+   * Injected by the production entrypoints (`video.ts` / `cli.ts`); tests may omit it, in which
+   * case validation is skipped and behaviour is exactly as before.
+   */
+  storyValidator?: StoryValidator;
+  /**
+   * PHASE 3 policy: also block PAID generation when the validator reports WARNINGs.
+   * Default FALSE — warnings are surfaced for human review but do not stop production.
+   * BLOCKERs always stop generator-consuming steps regardless of this flag.
+   */
+  blockOnStoryWarnings?: boolean;
 }
 
 /**
@@ -259,6 +285,13 @@ export type SceneExecutorFactory = (input: {
   flow?: any;
   /** OPT-IN exact scene-local authorization; forwarded verbatim to the real adapter. */
   sceneLocalAuthorization?: SceneLocalAuthorization | null;
+  /**
+   * PHASE 3 report forwarded to the real adapter so each scene can be defended against a
+   * BLOCKER that names it. Undefined when no validator ran (the adapter then does not gate).
+   */
+  storyValidation?: StoryValidationResult;
+  /** PHASE 3 policy forwarded so the adapter blocks scenes with WARNINGs when strict review is on. */
+  blockOnStoryWarnings?: boolean;
 }) => SceneExecutor;
 
 /**
@@ -364,6 +397,68 @@ export function validatePipelineShape(pipeline: any): { ok: boolean; reason?: st
     if (!String(s?.background_tag ?? '').trim()) return { ok: false, reason: `scene ${s.scene_number} missing background_tag` };
   }
   return { ok: true };
+}
+
+/**
+ * PHASE 3 — run the injected read-only validator and derive the gate decision.
+ *
+ * The validator boundary is optional: without it, nothing is spawned and the workflow behaves
+ * exactly as before (important for the existing injectable-boundary tests).
+ */
+async function auditStory(
+  opts: WorkflowOptions,
+  paths: ProjectPaths,
+): Promise<{ storyValidation?: StoryValidationResult; storyGate: StoryGateDecision }> {
+  if (!opts.storyValidator) return { storyGate: { allowed: true } };
+  let storyValidation: StoryValidationResult;
+  try {
+    storyValidation = await opts.storyValidator({
+      projectFile: paths.pipelineFile,
+      strict: opts.blockOnStoryWarnings === true,
+    });
+  } catch (error: any) {
+    // A validator crash must never be mistaken for a clean story.
+    storyValidation = {
+      ok: false,
+      available: false,
+      status: 'UNAVAILABLE',
+      projectId: paths.projectId,
+      projectFile: paths.pipelineFile,
+      exitCode: null,
+      blockers: [],
+      warnings: [],
+      infos: [],
+      reason: `validator failed: ${String(error?.message ?? error).slice(0, 300)}`,
+      stdout: '',
+      stderr: '',
+    };
+  }
+  const storyGate = decideStoryGate(storyValidation, {
+    blockOnWarnings: opts.blockOnStoryWarnings === true,
+    allowUnavailable: opts.runFlow !== true,
+  });
+  return { storyValidation, storyGate };
+}
+
+/** Report a blocked story gate as a workflow result without touching the project. */
+function storyGateBlockedResult(
+  paths: ProjectPaths,
+  decision: StoryGateDecision,
+  extra: Partial<WorkflowResult> = {},
+): WorkflowResult {
+  return {
+    projectId: paths.projectId,
+    projectPath: paths.pipelineFile,
+    projectRoot: path.dirname(paths.pipelineFile),
+    status: 'PERMANENT_FAILURE',
+    phase: 'FAILED',
+    blockers: [{ category: 'other', detail: `story validation ${decision.code ?? 'blocked'}: ${decision.reason ?? 'blocked'}` }],
+    completed: [],
+    nextAction: 'Fix the story/scene findings (npm run video -- validate --project <pipeline.json>) before generating.',
+    resumable: true,
+    reason: decision.reason,
+    ...extra,
+  };
 }
 
 async function readPipelineRaw(pipelineFile: string): Promise<string | null> {
@@ -541,9 +636,27 @@ export async function createProjectWorkflow(opts: WorkflowOptions & {
     return { projectId, projectPath: paths.pipelineFile, projectRoot, status: 'PERMANENT_FAILURE', phase: 'FAILED', blockers: [{ category: 'other', detail: `generated pipeline is invalid: ${shaped.reason}` }], completed: [], nextAction: 'Fix the story generator output.', resumable: false, reason: shaped.reason };
   }
 
+  // PHASE 3: audit the JUST-GENERATED story/scene structure. A blocked pipeline is NOT reported
+  // as a usable creation (that would invite paid generation on a broken story), but the generated
+  // files are left exactly as produced so the human can inspect or regenerate them.
+  const { storyValidation, storyGate } = await auditStory(opts, paths);
+  if (!storyGate.allowed) {
+    return storyGateBlockedResult(paths, storyGate, {
+      storyValidation,
+      storyGate,
+      completed: ['pipeline created (validation blocked)'],
+    });
+  }
+
   // 5. Report the required external inputs via the read-only readiness path.
   const status = await projectWorkflowStatus({ ...opts, projectId });
-  return { ...status, status: status.status, completed: ['pipeline created', ...status.completed], nextAction: status.nextAction };
+  return {
+    ...status,
+    status: status.status,
+    completed: ['pipeline created', ...status.completed],
+    nextAction: status.nextAction,
+    ...(storyValidation ? { storyValidation, storyGate } : {}),
+  };
 }
 
 /**
@@ -568,6 +681,14 @@ export async function resumeProjectWorkflow(opts: WorkflowOptions & { projectId:
   // terminal phase, and is surfaced on the result for the publish boundary.
   const approval = await approvalFor(opts, paths);
   const approvedNow = approval.status === 'APPROVED';
+
+  // PHASE 3: READ-ONLY story/scene audit (no writes, no credits). Enforcement applies only when
+  // this run can actually spend Flow credits (`--run-flow`); a zero-credit resume still reports
+  // the findings so the human can fix them before asking for generation.
+  const { storyValidation, storyGate } = await auditStory(opts, paths);
+  if (opts.runFlow === true && !storyGate.allowed) {
+    return storyGateBlockedResult(paths, storyGate, { storyValidation, storyGate, requiredInputs: handoff });
+  }
 
   // STEP-8GQ: scoped scene execution. Validate the selection against THIS pipeline (project
   // isolation), fail closed, and normalize to a deterministic ascending list.
@@ -643,6 +764,8 @@ export async function resumeProjectWorkflow(opts: WorkflowOptions & { projectId:
           ffprobePath: opts.ffprobePath,
           flow: sceneFlowClient,
           sceneLocalAuthorization: opts.sceneLocalAuthorization ?? null,
+          storyValidation,
+          blockOnStoryWarnings: opts.blockOnStoryWarnings === true,
         })
       : undefined);
     return runProject({ projectId: paths.projectId, projectsRoot: opts.projectsRoot, inputsRoot: opts.inputsRoot, outputsRoot: opts.outputsRoot, ffprobePath: opts.ffprobePath, host: opts.host, logRetention: opts.logRetention, logMaxBytes: opts.logMaxBytes, stageExecutor, sceneExecutor, onlyScenes: scopedScenes, stageInputs: opts.stageInputs, approved: approvedNow, flowExecutionEnabled: useSession === true });
@@ -696,6 +819,7 @@ export async function resumeProjectWorkflow(opts: WorkflowOptions & { projectId:
     production,
     flow: flowResult.flow,
     approval,
+    ...(storyValidation ? { storyValidation, storyGate } : {}),
     ...(scopedScenes ? { scope: { scenes: scopedScenes, executed: (production.orchestration?.executedScenes ?? []) as number[], failed: (production.orchestration?.failedScenes ?? []) as number[] } } : {}),
   };
 }
@@ -723,6 +847,16 @@ export function renderWorkflowReport(r: WorkflowResult): string {
       if (clips.length) lines.push(`    flow clips:  scene ${clips.map((c) => c.scene).join(', ')}`);
       if (h.music.length) lines.push(`    music:       ${h.music.join(', ')}`);
       if (h.branding.length) lines.push(`    branding:    ${h.branding.join(', ')}`);
+    }
+  }
+  if (r.storyValidation) {
+    if (r.storyValidation.report) {
+      lines.push(renderStoryReport(r.storyValidation.report, { maxPerSeverity: 8 }));
+    } else {
+      lines.push(`story:    UNAVAILABLE (${r.storyValidation.reason ?? 'the validator produced no report'})`);
+    }
+    if (r.storyGate && !r.storyGate.allowed) {
+      lines.push(`story gate: ${r.storyGate.code}${r.storyGate.reason ? ` — ${r.storyGate.reason}` : ''}`);
     }
   }
   return lines.join('\n');

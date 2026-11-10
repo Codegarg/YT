@@ -1,4 +1,4 @@
-import fs from 'node:fs/promises'; import path from 'node:path'; import { start } from './flowClient.js'; import { run, selectWork } from './runner.js'; import { ensureProjectOpen, projectEntryDeps } from './projectEntry.js'; import { Pipeline, RunOptions } from './types.js'; import { WAITING_FOR_EXTERNAL_BACKGROUND_INPUT, CURRENT_UI_NO_DETERMINISTIC_IMAGE_PATH } from './flowCapabilities.js'; import { withFlowSessionLock } from './projectOrchestrator.js'; import { flowCliShouldAcquireLock, flowCliLockRoot } from './flowCliLock.js';
+import fs from 'node:fs/promises'; import path from 'node:path'; import { fileURLToPath } from 'node:url'; import { start } from './flowClient.js'; import { run, selectWork } from './runner.js'; import { ensureProjectOpen, projectEntryDeps } from './projectEntry.js'; import { Pipeline, RunOptions } from './types.js'; import { WAITING_FOR_EXTERNAL_BACKGROUND_INPUT, CURRENT_UI_NO_DETERMINISTIC_IMAGE_PATH } from './flowCapabilities.js'; import { withFlowSessionLock } from './projectOrchestrator.js'; import { flowCliShouldAcquireLock, flowCliLockRoot } from './flowCliLock.js'; import { createPythonStoryValidator } from './storyValidation.js';
 function arg(name:string, fallback?:string){ const i=process.argv.indexOf(name); return i>=0?process.argv[i+1]??fallback:fallback; }
 function hasFlag(name:string){ return process.argv.includes(name); }
 function flagValue(name:string){ const i=process.argv.indexOf(name); return i>=0?process.argv[i+1]:undefined; }
@@ -124,6 +124,36 @@ try {
   }
 } finally { await context.close(); }
 }
+
+// PHASE 3: fail closed BEFORE any Chrome/Flow submission. The story/scene audit is READ-ONLY and
+// must report no BLOCKER (or no WARNING when FLOW_STORY_WARNINGS_BLOCK=1) for a paid CLI run.
+// The audit never writes into the project and never spends a credit.
+const storyStrict = process.env.FLOW_STORY_WARNINGS_BLOCK === '1';
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+const storyValidation = await createPythonStoryValidator({ repoRoot })({ projectFile: file, strict: storyStrict });
+if (!storyValidation.available) {
+  await log('story_validation_unavailable', { reason: storyValidation.reason ?? 'no report' });
+  throw new Error(`Story validation could not run (${storyValidation.reason ?? 'no report'}); no Flow work was submitted. Inspect it: npm run video -- validate --project "${file}"`);
+}
+if (storyValidation.blockers.length > 0) {
+  await log('story_validation_blocked', {
+    status: storyValidation.status,
+    blockers: storyValidation.blockers.map((finding) => finding.code),
+    first: storyValidation.blockers[0]?.message,
+    hint: `No credits were spent. Fix the findings, then re-run: npm run video -- validate --project "${file}"`,
+  });
+  throw new Error(`Story validation BLOCKED this run: ${storyValidation.blockers[0]?.code} — ${storyValidation.blockers[0]?.message}. No Flow work was submitted.`);
+}
+if (storyStrict && storyValidation.warnings.length > 0) {
+  await log('story_validation_review_required', {
+    status: storyValidation.status,
+    warnings: storyValidation.warnings.map((finding) => finding.code),
+    first: storyValidation.warnings[0]?.message,
+    hint: 'FLOW_STORY_WARNINGS_BLOCK=1 treats human-review warnings as blocking. No credits were spent.',
+  });
+  throw new Error(`Story validation requires review (${storyValidation.warnings.length} warning(s)); FLOW_STORY_WARNINGS_BLOCK=1 blocks paid generation. No Flow work was submitted.`);
+}
+if (storyValidation.report) await log('story_validation_passed', { status: storyValidation.status, warnings: storyValidation.warnings.length, infos: storyValidation.infos.length });
 
 if (flowCliShouldAcquireLock()) {
   await withFlowSessionLock({ lockRoot: flowCliLockRoot() }, runFlowSession);

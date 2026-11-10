@@ -29,6 +29,7 @@ import { planIsolatedSceneMix, runIsolatedSceneMix, parseMaxStretchOverride } fr
 import { MAX_NARRATION_VIDEO_STRETCH } from './narrationDurationPolicy.js';
 import { runMediaQa, renderMediaQaReport } from './mediaQa.js';
 import { generationLedgerPath, readGenerationLedger, renderGenerationHistory } from './generationAttempts.js';
+import { createPythonStoryValidator, renderStoryReport, type StoryValidationResult } from './storyValidation.js';
 
 function arg(name: string, fallback?: string): string | undefined { const i = process.argv.indexOf(name); return i >= 0 ? process.argv[i + 1] ?? fallback : fallback; }
 function jsonFlag(): boolean { return process.argv.includes('--json'); }
@@ -61,6 +62,10 @@ function flowOptions() {
       inputsRoot: INPUTS_ROOT,
       outputsRoot: OUTPUTS_ROOT,
       ffprobePath: process.env.FFPROBE_PATH,
+      // PHASE 3: the CLI-subprocess Flow path is gated BEFORE the lock/subprocess, so a broken
+      // story can never reach a paid Flow submission through either Flow strategy.
+      storyValidator: createPythonStoryValidator({ repoRoot: REPO_ROOT }),
+      blockOnStoryWarnings: hasFlag('--story-warnings-block'),
     }),
   };
 }
@@ -83,6 +88,18 @@ function flowSessionOptions() {
  * `video resume --only N` actually executes scenes through the existing `processSingleFlowScene`.
  * No Flow client is required: a locally-valid scene resolves to USE_LOCAL inside the workflow.
  */
+/**
+ * PHASE 3 story/scene intelligence boundary. Read-only: it shells out to the existing
+ * `python -m pipeline.one_minute --check` CLI and never writes, never spends credits.
+ * `--story-warnings-block` makes a human-review WARNING stop PAID generation too.
+ */
+function storyValidationOptions() {
+  return {
+    storyValidator: createPythonStoryValidator({ repoRoot: REPO_ROOT }),
+    blockOnStoryWarnings: hasFlag('--story-warnings-block'),
+  };
+}
+
 function sceneExecutorOptions() {
   return {
     sceneExecutorFactory: (input: any) => createRealSceneExecutor({
@@ -94,6 +111,8 @@ function sceneExecutorOptions() {
       ffprobePath: input.ffprobePath ?? process.env.FFPROBE_PATH,
       flow: input.flow,
       sceneLocalAuthorization: input.sceneLocalAuthorization ?? null,
+      storyValidation: input.storyValidation,
+      blockOnStoryWarnings: input.blockOnStoryWarnings === true,
     }),
   };
 }
@@ -163,6 +182,7 @@ export function buildResumeOptions(runFlow: boolean, includeSession: boolean, on
     ...flowOptions(),
     ...sessionOpts,
     ...sceneExecutorOptions(),
+    ...storyValidationOptions(),
     only,
     runFlow,
   };
@@ -186,9 +206,16 @@ function emit(r: WorkflowResult): number {
  */
 export function renderUsage(): string {
   return [
-    'Usage: npm run video -- <create|resume|status|approve|publish-status|health|seo|qa|mix-validate|flow-attempts>',
+    'Usage: npm run video -- <create|resume|status|validate|approve|publish-status|health|seo|qa|mix-validate|flow-attempts>',
     '  [--title ...] [--project <pipeline.json>] [--only 1,2,3] [--run-flow] [--flow-session] [--yes] [--json]',
     '  create: [--seo]   # opt-in: also generate the reviewable SEO package for the new story',
+    '  validate: --project <pipeline.json> | --project-id <id> [--json] [--strict]',
+    '       # READ-ONLY story & scene intelligence: structural BLOCKERs, human-review WARNINGs and',
+    '       # INFO context. It writes nothing, calls no model and spends no credits. Exit 0 = no',
+    '       # blockers, 1 = blocked (or warnings with --strict), 2 = usage.',
+    '  resume|create: [--story-warnings-block]',
+    '       # Treat validation WARNINGs as blocking for PAID generation (--run-flow). Default:',
+    '       # blockers stop generation; warnings are reported and reviewed by a human.',
     '  approve: [--candidate <path inside project outputs> --sha256 <expected SHA-256>]',
     '  flow-attempts: --project-id <id> | --project <pipeline.json> [--limit N] [--json]',
     '       # READ-ONLY: per-scene/asset attempt budget, failure category, submission state,',
@@ -273,11 +300,39 @@ async function main(): Promise<number> {
     return 0;
   }
 
+  if (command === 'validate') {
+    // PHASE 3 READ-ONLY story & scene audit. Delegates to the ONE canonical validator
+    // (`python -m pipeline.one_minute --check`); this command has no write path at all.
+    const projectArg = arg('--project');
+    const projectIdArg = arg('--project-id');
+    if (!projectArg && !projectIdArg) {
+      console.error('video validate requires --project <pipeline.json> or --project-id <id>.');
+      return 2;
+    }
+    const projectFile = projectArg
+      ? path.resolve(String(projectArg))
+      : path.join(PROJECTS_ROOT, String(projectIdArg), 'pipeline.json');
+    const result = await createPythonStoryValidator({ repoRoot: REPO_ROOT })({ projectFile, strict: hasFlag('--strict') });
+    if (jsonFlag()) {
+      console.log(JSON.stringify(result.report ?? {
+        ok: false, status: result.status, read_only: true, project_file: result.projectFile,
+        project_id: result.projectId, reason: result.reason ?? 'the validator produced no report',
+      }, null, 2));
+    } else if (result.report) {
+      console.log(renderStoryReport(result.report));
+    } else {
+      console.error(`video validate: ${result.reason ?? 'the validator produced no report'}`);
+    }
+    if (!result.available || result.blockers.length) return 1;
+    return hasFlag('--strict') && result.warnings.length ? 1 : 0;
+  }
+
   if (command === 'create') {
     const title = arg('--title');
     if (!title) { console.error('video create requires --title "<story title>".'); return 2; }
     const r = await createProjectWorkflow({
       ...baseOptions(),
+      ...storyValidationOptions(),
       title,
       concept: arg('--concept'),
       durationMinutes: arg('--duration') ? Number(arg('--duration')) : undefined,

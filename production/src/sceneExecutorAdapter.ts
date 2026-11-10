@@ -40,6 +40,7 @@ import { renderScene } from './sceneRenderer.js';
 import { motionFromSceneText, sceneClipFilename } from './sceneRender.js';
 import { safeTagStem } from './assetCache.js';
 import type { CharacterPlacement } from './characterComposite.js';
+import { decideSceneStoryGate, type StoryValidationResult } from './storyValidation.js';
 import type { SceneExecutor } from './projectWorkflow.js';
 
 export interface CreateRealSceneExecutorOptions {
@@ -80,6 +81,13 @@ export interface CreateRealSceneExecutorOptions {
   flow?: any;
   /** Optional flow provider for a later production wiring (still owned elsewhere). */
   flowProvider?: () => Promise<any>;
+  /**
+   * PHASE 3 report forwarded by the workflow. When present, a scene named by a BLOCKER (or a
+   * WARNING under strict review) is refused before any Flow/local work is attempted.
+   */
+  storyValidation?: StoryValidationResult;
+  /** PHASE 3 policy: scene-scoped WARNINGs also block this scene (explicit strict review). */
+  blockOnStoryWarnings?: boolean;
 }
 
 /** Normalise a scene number from either the inspection shape or the pipeline scene shape. */
@@ -210,6 +218,14 @@ export function createRealSceneExecutor(opts: CreateRealSceneExecutorOptions): S
     // 2. Resolve the pipeline scene by number (never re-derive prompts/identity here).
     const pipelineScene = scenesByNumber.get(n);
     if (!pipelineScene) return { ok: false, reason: `Scene ${n} is not present in the bound pipeline.` };
+
+    // 2a. PHASE 3 per-scene defence. The project-level gate already ran; this is the last line of
+    // defence (e.g. a scoped run whose only finding is on THIS scene). Only scene-scoped findings
+    // are considered, so an unrelated project-level finding never blocks a valid local render.
+    const sceneGate = decideSceneStoryGate(opts.storyValidation, n, opts.blockOnStoryWarnings === true);
+    if (!sceneGate.allowed) {
+      return { ok: false, reason: `Scene ${n} blocked by story validation: ${sceneGate.reason ?? 'see the validation report'}` };
+    }
 
     // 2b. RENDER-MODE DISPATCH (pure decision from the orchestrator's own inspection).
     // SUPPLIED_VIDEO keeps the proven Flow/USE_LOCAL path unchanged; LOCAL_SYNTHESIS goes to the

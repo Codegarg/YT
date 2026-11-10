@@ -1102,13 +1102,20 @@ if __name__ == "__main__":
     parser.add_argument("--scenes", type=int, default=None, help="Exact scene count override (default: story-determined, max 35).")
     parser.add_argument("--monster", default=None, help="Optional supernatural entity override.")
     parser.add_argument("--check", action="store_true",
-                        help="READ-ONLY audit of an existing project (--project-id). Writes nothing and calls no model.")
+                        help="READ-ONLY audit of an existing project (--project-id or --project-file). "
+                             "Writes nothing and calls no model.")
+    parser.add_argument("--project-file", default=None,
+                        help="With --check: explicit path to a pipeline.json (default: <projects>/<project-id>/pipeline.json).")
+    parser.add_argument("--strict", action="store_true",
+                        help="With --check: also exit 1 when story/scene WARNINGS need human review (blockers already exit 1).")
     args = parser.parse_args()
     if args.check:
         from . import project_check  # imported here so the generator path never depends on it
 
-        report = project_check.run_check(PROJECTS_ROOT / args.project_id / "pipeline.json")
+        target = Path(args.project_file) if args.project_file else PROJECTS_ROOT / args.project_id / "pipeline.json"
+        report = project_check.run_check(target)
         print(json.dumps(report, ensure_ascii=False, indent=2))
-        raise SystemExit(0 if report["ok"] else 1)
+        failed = not report["ok"] or (args.strict and report.get("status") != "PASS")
+        raise SystemExit(1 if failed else 0)
     print(generate(args.project_id, args.model, title=args.title, concept=args.concept,
                    duration_minutes=args.duration, scene_count=args.scenes, monster=args.monster))

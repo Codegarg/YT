@@ -25,6 +25,7 @@ import { validateVideoClip } from './videoClip.js';
 import { sceneClipDestination } from './sceneFlowWorkflow.js';
 import { withFlowSessionLock } from './projectOrchestrator.js';
 import { flowSubprocessEnv } from './flowCliLock.js';
+import { decideStoryGate, type StoryValidator } from './storyValidation.js';
 import type { FlowRunner } from './projectWorkflow.js';
 
 export type FlowRunStatus = 'COMPLETED' | 'WAITING_FOR_INPUTS' | 'FLOW_REQUIRED' | 'FLOW_MEDIA_RECOVERY_REQUIRED' | 'RECOVERABLE_FAILURE' | 'FAILED';
@@ -172,6 +173,13 @@ export interface CreateRealFlowRunnerOptions {
   flowLockRoot?: string;
   /** Subprocess override (tests). */
   runFlowSubprocess?: FlowRunnerInput['runFlowSubprocess'];
+  /**
+   * PHASE 3 read-only story/scene validator. When provided, a PAID run is gated BEFORE the
+   * Flow session lock is acquired and before any child process can submit anything.
+   */
+  storyValidator?: StoryValidator;
+  /** PHASE 3 policy: WARNINGs also block paid generation (explicit strict review). */
+  blockOnStoryWarnings?: boolean;
 }
 
 /**
@@ -226,6 +234,31 @@ export function createRealFlowRunner(opts: CreateRealFlowRunnerOptions): FlowRun
         reason: `Flow generation required for scene(s) ${needs.needsGeneration.join(', ')}; re-run with Flow enabled (--run-flow) to proceed.`,
         blockers: [`flow-required: ${needs.needsGeneration.join(', ')}`],
       };
+    }
+
+    // 5b. PHASE 3 gate: a READ-ONLY story/scene audit must pass BEFORE the Flow session lock is
+    // acquired and before any child process exists. A validator that cannot run fails CLOSED for
+    // a paid run (no report ⇒ no proof the story is sound ⇒ no submission).
+    if (opts.storyValidator) {
+      let validation: Awaited<ReturnType<StoryValidator>>;
+      try {
+        validation = await opts.storyValidator({ projectFile: pipelineFile, strict: opts.blockOnStoryWarnings === true });
+      } catch (e: any) {
+        validation = {
+          ok: false, available: false, status: 'UNAVAILABLE', projectId, projectFile: pipelineFile,
+          exitCode: null, blockers: [], warnings: [], infos: [],
+          reason: `validator failed: ${String(e?.message ?? e).slice(0, 300)}`, stdout: '', stderr: '',
+        };
+      }
+      const gate = decideStoryGate(validation, { blockOnWarnings: opts.blockOnStoryWarnings === true, allowUnavailable: false });
+      if (!gate.allowed) {
+        return {
+          ok: false,
+          status: 'FAILED',
+          reason: `Story validation blocked paid generation (${gate.code}): ${gate.reason ?? 'see the validation report.'}`,
+          blockers: [`story-validation: ${gate.code}: ${gate.reason ?? 'blocked'}`],
+        };
+      }
     }
 
     // 6. Enter Flow work under the shared session lock (never the project lock).

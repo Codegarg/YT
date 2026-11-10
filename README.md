@@ -31,7 +31,7 @@ This is a local-only project. Nothing requires Railway or a cloud browser sessio
 .\start-video.ps1 -Title "आख़िरी बस की तीसरी सीट" -Concept "बरसाती रात में तीसरी सीट पर बैठी प्रेत-आत्मा"
 ```
 
-`start-video.ps1` is a thin **compatibility wrapper**: it loads `scripting/.env` and delegates to the canonical workflow entrypoint `npm run video -- create` (run from `production/`), then prints the exact continuation commands. It does **not** itself run Flow, production stages, approval, or publishing. `npm run video -- <create|status|health|resume|approve|publish-status>` (in `production/`) is the single authoritative workflow; use `resume --run-flow --flow-session` only when Flow work is explicitly required.
+`start-video.ps1` is a thin **compatibility wrapper**: it loads `scripting/.env` and delegates to the canonical workflow entrypoint `npm run video -- create` (run from `production/`), then prints the exact continuation commands. It does **not** itself run Flow, production stages, approval, or publishing. `npm run video -- <create|status|validate|health|resume|approve|publish-status>` (in `production/`) is the single authoritative workflow; use `resume --run-flow --flow-session` only when Flow work is explicitly required.
 
 The launcher creates a fresh **5-minute** project with about **35 structured scenes** (7 scenes per minute, 16:9). Override the target with `-Duration <minutes>` and/or `-Scenes <count>`. Flow itself decides every scene's natural duration; no scene is forced to six seconds. The Flow runner is resumable: it skips completed assets and retries pending/failed ones with exponential backoff (default 6-hour cap) before giving up.
 
@@ -194,6 +194,10 @@ npm run video -- resume --project <pipeline.json> --run-flow --flow-session --ap
 The full procedure (failure categories, resume steps, corrupt-ledger handling, how to read the
 history) is in [`docs/GENERATION_SAFETY.md`](docs/GENERATION_SAFETY.md).
 
+Story/scene validation (`npm run video -- validate`, PHASE 3) runs **before** this ledger: it is a
+refusal to start, not a failed attempt, so it never reserves, releases or resets a budget and
+never writes `generation-attempts.json`, checkpoints, `state.json`, approvals or review records.
+
 ### Final edit with natural clip lengths and fades
 
 Flow clips are never trimmed to a fixed duration. After downloading the completed `scene-####.mp4` files, preserve every clip in full and assemble them with short audio/video fades:
@@ -232,23 +236,38 @@ The music downloader saves a license record beside the downloaded file. Final FF
 
 ### Read-only checks before approval
 
-Three checks never write, never call a paid API and never upload. Run them before the approval questions:
+Four checks never write, never call a paid API and never upload. Run them before the approval questions:
 
 ```powershell
 # 0. environment/setup readiness for this checkout (offline, free, temp writes only)
 cd production
 npm run smoke
 
-# 1. story/scene structure + repetition/opening/ending warnings (never writes pipeline.json)
+# 1. story/scene intelligence: BLOCKERs, human-review WARNINGs and INFO (never writes pipeline.json)
+npm run video -- validate --project ..\scripting\projects\your-project\pipeline.json
+npm run video -- validate --project ..\scripting\projects\your-project\pipeline.json --json
+
+# 2. the same audit through the scripting half (unchanged; --project-file is also supported)
 cd ..\scripting
 .venv\Scripts\python.exe -m pipeline.one_minute --project-id your-project --check
 cd ..\production
 
-# 2. finished-render QA: 16:9, resolution, black/freeze frames, loudness, clipping (read-only)
+# 3. finished-render QA: 16:9, resolution, black/freeze frames, loudness, clipping (read-only)
 npm run video -- qa --input outputs\your-project\final-title.mp4 --json
 ```
 
-`--check` exits nonzero only for structural errors; story-quality observations are warnings. `qa` exits nonzero only for hard failures (unreadable container, wrong aspect, sub-minimum resolution, duration out of tolerance, clipping/true-peak at full scale). Neither command approves, publishes or changes a file.
+Validation classifies findings as `BLOCKER` (the project cannot be produced correctly),
+`WARNING` (a quality issue a human should review) and `INFO` (context only). **Blockers always
+stop paid generation; warnings do not** unless you ask for a hard gate with
+`--story-warnings-block`. The gate runs before the Flow session lock and before the Flow
+subprocess, so a blocked story never spends a credit. See
+[`docs/STORY_VALIDATION.md`](docs/STORY_VALIDATION.md) for every rule, the JSON contract and the
+relation to the generation-attempt budgets.
+
+`validate` and `--check` exit nonzero only for structural blockers (or warnings with
+`--strict`); `qa` exits nonzero only for hard failures (unreadable container, wrong aspect,
+sub-minimum resolution, duration out of tolerance, clipping/true-peak at full scale). Neither
+command approves, publishes or changes a file.
 
 See `docs/FUTURE_PIPELINE_OPTIMIZATION.md` for the full architecture audit, the target stage contract, and the documented (not yet implemented) improvements.
 
