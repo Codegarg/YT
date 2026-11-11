@@ -284,6 +284,47 @@ shown to the reviewer, and `--qa-warnings-block` makes warnings blocking too. If
 changes after QA, its stored evidence no longer matches and approval becomes stale. See
 [`docs/MEDIA_QA.md`](docs/MEDIA_QA.md) for thresholds, the JSON contract and known limitations.
 
+### Long-form reliability: resume, idempotency and the output contract
+
+Every production stage has an explicit state (`pending`, `running`, `completed`, `failed`,
+`blocked`, `skipped`, `stale`) derived from real evidence — the pipeline, scene sidecars,
+`.stage` sidecars and the approval record. Nothing is inferred from a previous run's summary.
+
+```powershell
+cd production
+
+# what would resume from where, what is reusable, and which gate is next (read-only)
+npm run video -- status --project ..\scripting\projects\your-project\pipeline.json
+
+# resume with the opt-in resource preflight (ffmpeg/ffprobe, outputs dir, free disk)
+npm run video -- resume --project ..\scripting\projects\your-project\pipeline.json --preflight
+
+# one mapped long-form contract: duration, streams, 16:9/resolution, fps, A/V sync,
+# scene order, narration coverage, TITLE/branding, QA hash binding and approval (read-only)
+npm run video -- contract --project ..\scripting\projects\your-project\pipeline.json
+```
+
+Resume rules:
+
+- The earliest genuinely incomplete or invalid stage is the resume point.
+- Verified outputs are reused; unchanged stages never re-render, re-download or re-checkpoint.
+- A changed input invalidates that stage and its dependents; unrelated stages stay reusable.
+- A downloaded clip must validate before a success checkpoint is written — a transport success
+  with an unusable file records `DOWNLOAD_FAILED`, never `DOWNLOAD_SUCCESS`.
+- An ambiguous paid Flow submission is never retried automatically (the Phase 2 ledger stays
+  authoritative).
+- Partial files are never auto-deleted.
+- A render success is never a publishable video: `contract` reports `publishable: true` only for a
+  QA-clean artifact with an explicit, hash-bound human approval, and even then only as
+  `READY_FOR_EXTERNAL_PUBLISHER`.
+
+The preflight fails closed **before** the project lock is taken, naming the failing category
+(`DEPENDENCY_MISSING`, `OUTPUT_DIR_INVALID`, `INSUFFICIENT_DISK`); unknown free-space capacity is
+a warning, not a failure. Per-run evidence (`run.log.jsonl`, stage log records) never contains
+cookies, tokens, signed URLs or private machine paths. See
+[`docs/PRODUCTION_RELIABILITY.md`](docs/PRODUCTION_RELIABILITY.md) for the stage state model,
+checkpoint semantics, recovery rules, failure categories and known limitations.
+
 See `docs/FUTURE_PIPELINE_OPTIMIZATION.md` for the full architecture audit, the target stage contract, and the documented (not yet implemented) improvements.
 
 ### Approval and optional YouTube publishing

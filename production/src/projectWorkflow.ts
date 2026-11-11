@@ -45,6 +45,11 @@ import {
   type StoryValidator,
   type StoryValidationResult,
 } from './storyValidation.js';
+import {
+  deriveReliability,
+  type ReliabilityReport,
+  type ReliabilityStage,
+} from './reliability.js';
 
 // ---------------------------------------------------------------------------------------
 // Workflow phases (reporting only — state.json stays authoritative)
@@ -91,6 +96,14 @@ export interface WorkflowResult {
   storyValidation?: StoryValidationResult;
   /** The gate decision derived from `storyValidation` (absent when no validator ran). */
   storyGate?: StoryGateDecision;
+  /**
+   * PHASE 5 derived reliability view (stage states, resume point, next gate, observability).
+   * Read-only and purely additive: `state.json` and the generation ledger remain authoritative.
+   * Present whenever a project inspection produced per-scene evidence.
+   */
+  reliability?: ReliabilityReport;
+  /** PHASE 5 preflight evidence when `--preflight` was requested. */
+  preflight?: import('./resourcePreflight.js').PreflightReport;
   /** Reason for a hard failure (malformed pipeline, generator failure, collision). */
   reason?: string;
 }
@@ -109,6 +122,13 @@ export interface WorkflowOptions {
   inputsRoot: string;
   outputsRoot: string;
   ffprobePath?: string;
+  /** ffmpeg binary (preflight probe / stage media checks). Defaults to FFMPEG_PATH. */
+  ffmpegPath?: string;
+  /**
+   * PHASE 5 opt-in resource preflight on the execution path (dependency executables, outputs-dir
+   * usability, conservative free-disk estimate). Never runs for status/dry inspection.
+   */
+  preflight?: boolean;
   host?: string;
   /** Bounded run-log controls (forwarded to runProject). */
   logRetention?: number;
@@ -470,6 +490,85 @@ function failedStagesOf(production: RunProjectResult): string[] {
   return (production.orchestration?.downstream?.failedStages ?? []) as string[];
 }
 
+/**
+ * PHASE 5: derive the reliability view from the evidence a project inspection already produced.
+ *
+ * Nothing here is measured twice and nothing is written: it maps the existing per-scene/stage
+ * states onto the explicit reliability vocabulary so a long-form run can answer "where do I
+ * resume from?" without inventing a second state store. Returns undefined when no per-scene
+ * evidence exists (a run that failed before inspection must not claim stage states).
+ */
+function reliabilityFor(input: {
+  projectId: string;
+  pipeline: any;
+  production: RunProjectResult;
+  approval?: WorkflowResult['approval'];
+  storyValidation?: StoryValidationResult;
+  storyGate?: StoryGateDecision;
+  retryCounts?: Partial<Record<ReliabilityStage, number>>;
+  now?: string;
+}): ReliabilityReport | undefined {
+  const orchestration = input.production?.orchestration;
+  const workItems: any[] = Array.isArray(orchestration?.scenes) ? orchestration.scenes : [];
+  if (workItems.length === 0) return undefined;
+
+  const outputHashes = (orchestration?.sceneOutputHashes ?? {}) as Record<string, string>;
+  const narrationInputs = (orchestration?.narrationInputs ?? {}) as Record<string, unknown>;
+  const downstream = orchestration?.downstream ?? null;
+  const record = input.approval?.record;
+  const mediaQa = record?.media_qa;
+  const storyValidation = input.storyValidation;
+
+  try {
+    return deriveReliability({
+      projectId: input.projectId,
+      now: input.now,
+      pipeline: { present: true, valid: true, scenes: Array.isArray(input.pipeline?.scenes) ? input.pipeline.scenes : [] },
+      storyValidation: storyValidation
+        ? {
+            available: storyValidation.available !== false,
+            status: storyValidation.status,
+            blockers: (storyValidation.blockers ?? []).map((b: any) => String(b?.code ?? b)),
+            warnings: (storyValidation.warnings ?? []).map((w: any) => String(w?.code ?? w)),
+            reason: storyValidation.reason,
+          }
+        : null,
+      storyGate: input.storyGate ? { allowed: input.storyGate.allowed, code: input.storyGate.code, reason: input.storyGate.reason } : null,
+      scenes: workItems.map((item) => ({
+        sceneNumber: Number(item.sceneNumber),
+        readiness: String(item.readiness ?? ''),
+        outputState: String(item.outputState ?? ''),
+        outputHash: outputHashes[String(item.sceneNumber)] ?? null,
+        renderKey: String(item.renderKey ?? '') || null,
+      })),
+      narration: {
+        present: Object.keys(narrationInputs).map(Number).filter((n) => Number.isInteger(n)),
+        missing: workItems.filter((item) => String(item.readiness ?? '') === 'WAITING_FOR_NARRATION').map((item) => Number(item.sceneNumber)),
+      },
+      downstream: downstream
+        ? {
+            states: downstream.states ?? {},
+            failedStages: downstream.failedStages ?? [],
+            executedStages: downstream.executedStages ?? [],
+            keys: downstream.keys ?? {},
+          }
+        : null,
+      failedScenes: (orchestration?.failedScenes ?? []) as number[],
+      qa: mediaQa
+        ? { status: mediaQa.status, artifactHash: mediaQa.artifact_hash, reportHash: mediaQa.report_hash, generatedAt: mediaQa.generated_at }
+        : null,
+      approval: input.approval
+        ? { status: input.approval.status, finalOutputHash: input.approval.finalOutputHash ?? null, reason: input.approval.reason }
+        : null,
+      retryCounts: input.retryCounts ?? null,
+    });
+  } catch {
+    // Reliability is a derived reporting view: if it cannot be derived, the workflow result stays
+    // exactly as before rather than turning a successful run into a failure.
+    return undefined;
+  }
+}
+
 /** Compute the current approval verdict (read-only; never approves). */
 async function approvalFor(opts: WorkflowOptions & { projectId: string }, paths: ProjectPaths): Promise<{ status: 'APPROVED' | 'NOT_APPROVED' | 'STALE_APPROVAL'; record?: ApprovalRecord; finalOutputHash?: string; reason?: string }> {
   const pipeline = await loadPipeline(paths);
@@ -561,6 +660,7 @@ export async function projectWorkflowStatus(opts: WorkflowOptions & { projectId:
   let phase = classifyWorkflowPhase({ runStatus, exists: true, pipelineValid: true, blockers: production.blockers, failedStages });
   // Approval only reshapes AWAITING_APPROVAL; it never causes the run to approve anything.
   if (phase === 'AWAITING_APPROVAL' && approval.status === 'APPROVED') phase = 'COMPLETED';
+  const reliability = reliabilityFor({ projectId: paths.projectId, pipeline, production, approval });
   return {
     projectId: paths.projectId,
     projectPath: paths.pipelineFile,
@@ -574,6 +674,7 @@ export async function projectWorkflowStatus(opts: WorkflowOptions & { projectId:
     requiredInputs: handoff,
     production,
     approval,
+    ...(reliability ? { reliability } : {}),
   };
 }
 
@@ -768,7 +869,7 @@ export async function resumeProjectWorkflow(opts: WorkflowOptions & { projectId:
           blockOnStoryWarnings: opts.blockOnStoryWarnings === true,
         })
       : undefined);
-    return runProject({ projectId: paths.projectId, projectsRoot: opts.projectsRoot, inputsRoot: opts.inputsRoot, outputsRoot: opts.outputsRoot, ffprobePath: opts.ffprobePath, host: opts.host, logRetention: opts.logRetention, logMaxBytes: opts.logMaxBytes, stageExecutor, sceneExecutor, onlyScenes: scopedScenes, stageInputs: opts.stageInputs, approved: approvedNow, flowExecutionEnabled: useSession === true });
+    return runProject({ projectId: paths.projectId, projectsRoot: opts.projectsRoot, inputsRoot: opts.inputsRoot, outputsRoot: opts.outputsRoot, ffprobePath: opts.ffprobePath, ffmpegPath: opts.ffmpegPath, preflight: opts.preflight === true, host: opts.host, logRetention: opts.logRetention, logMaxBytes: opts.logMaxBytes, stageExecutor, sceneExecutor, onlyScenes: scopedScenes, stageInputs: opts.stageInputs, approved: approvedNow, flowExecutionEnabled: useSession === true });
   };
 
   // Execute production — inside the Flow session when that strategy is selected.
@@ -805,6 +906,13 @@ export async function resumeProjectWorkflow(opts: WorkflowOptions & { projectId:
   if (flowResult.phase) phase = flowResult.phase;
   // Approval only reshapes the terminal phase; it never auto-approves or publishes.
   if (phase === 'AWAITING_APPROVAL' && approval.status === 'APPROVED') phase = 'COMPLETED';
+  const reliability = reliabilityFor({
+    projectId: paths.projectId,
+    pipeline,
+    production,
+    approval,
+    ...(storyValidation ? { storyValidation, storyGate } : {}),
+  });
   return {
     projectId: paths.projectId,
     projectPath: paths.pipelineFile,
@@ -820,6 +928,8 @@ export async function resumeProjectWorkflow(opts: WorkflowOptions & { projectId:
     flow: flowResult.flow,
     approval,
     ...(storyValidation ? { storyValidation, storyGate } : {}),
+    ...(reliability ? { reliability } : {}),
+    ...(production.preflight ? { preflight: production.preflight } : {}),
     ...(scopedScenes ? { scope: { scenes: scopedScenes, executed: (production.orchestration?.executedScenes ?? []) as number[], failed: (production.orchestration?.failedScenes ?? []) as number[] } } : {}),
   };
 }
@@ -832,6 +942,11 @@ export function renderWorkflowReport(r: WorkflowResult): string {
   lines.push(`phase:    ${r.phase}`);
   if (r.scope) lines.push(`scope:    scene(s) ${r.scope.scenes.join(', ')} (executed ${r.scope.executed.join(', ') || '-'}; failed ${r.scope.failed.join(', ') || '-'})`);
   if (r.approval) lines.push(`approval: ${r.approval.status}${r.approval.reason ? ` (${r.approval.reason})` : ''}`);
+  if (r.reliability) {
+    lines.push(`resume:   ${r.reliability.resume_from ?? '(production complete)'}`);
+    lines.push(`gate:     ${r.reliability.next_gate ?? '(all gates satisfied)'}`);
+  }
+  if (r.preflight) lines.push(`preflight: ${r.preflight.status} (${r.preflight.blockers.length} blocker(s))`);
   lines.push(`path:     ${r.projectPath || '(none)'}`);
   lines.push(`next:     ${r.nextAction}`);
   if (r.completed.length) lines.push(`done:     ${r.completed.join('; ')}`);

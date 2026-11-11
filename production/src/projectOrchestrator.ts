@@ -215,6 +215,7 @@ import { classifyFlowEligibility } from './sceneState.js';
 import { deriveFlowLocalState } from './flowMediaState.js';
 import { assertSafeProjectId } from './inputManifest.js';
 import { validateMusicInputs, validateBrandingInputs } from './inputValidator.js';
+import { preflightProject, type PreflightReport } from './resourcePreflight.js';
 
 export interface ProjectPaths { projectId: string; pipelineFile: string; inputsRoot: string; inputRoot: string; outputsRoot: string; outputsDir: string; }
 
@@ -296,6 +297,15 @@ export interface RunProjectConfig {
    * behavior unchanged.
    */
   flowExecutionEnabled?: boolean;
+  /**
+   * PHASE 5 opt-in resource preflight (dependency executables, outputs-dir usability, free disk).
+   * Only runs on a real execution (`dryRun` never probes or creates anything). A real blocker
+   * fails closed BEFORE the lock is taken, so a disk/dependency problem is a clear diagnostic
+   * rather than a mid-render crash.
+   */
+  preflight?: boolean;
+  /** ffmpeg binary for the preflight version probe (defaults to FFMPEG_PATH/`ffmpeg`). */
+  ffmpegPath?: string;
 }
 
 export interface RunProjectResult {
@@ -307,6 +317,8 @@ export interface RunProjectResult {
   resumable: boolean;
   lockAcquired: boolean;
   orchestration?: any;
+  /** PHASE 5 preflight evidence, when preflight was requested. */
+  preflight?: PreflightReport;
 }
 
 /**
@@ -321,6 +333,33 @@ export async function runProject(cfg: RunProjectConfig): Promise<RunProjectResul
   const pipeline = await loadPipeline(paths);
   if (!pipeline) {
     return { projectId: paths.projectId, status: 'PERMANENT_FAILURE', blockers: [{ category: 'other', detail: `pipeline.json not found at ${paths.pipelineFile}` }], completed: [], nextAction: 'Create the pipeline (story boundary) first.', resumable: true, lockAcquired: false };
+  }
+
+  // 1b. PHASE 5 opt-in resource preflight. Runs BEFORE the lock and before any render so a missing
+  // binary, unusable outputs dir or provably insufficient disk is reported as a named blocker
+  // instead of a half-written render. `dryRun` never probes or creates anything (zero writes).
+  let preflight: PreflightReport | undefined;
+  if (cfg.preflight === true && cfg.dryRun !== true) {
+    preflight = await preflightProject({
+      projectId: paths.projectId,
+      outputsDir: paths.outputsDir,
+      sceneCount: Array.isArray((pipeline as any)?.scenes) ? (pipeline as any).scenes.length : 0,
+      ffmpegPath: cfg.ffmpegPath ?? process.env.FFMPEG_PATH,
+      ffprobePath: cfg.ffprobePath ?? process.env.FFPROBE_PATH,
+      createOutputsDir: true,
+    });
+    if (!preflight.ok) {
+      return {
+        projectId: paths.projectId,
+        status: 'RECOVERABLE_FAILURE',
+        blockers: preflight.blockers.map((blocker) => ({ category: 'other' as const, detail: `preflight [${blocker.category}] ${blocker.detail}` })),
+        completed: [],
+        nextAction: `Fix the ${preflight.status} preflight blocker before rendering, then resume.`,
+        resumable: true,
+        lockAcquired: false,
+        preflight,
+      };
+    }
   }
 
   // 2. Acquire the per-project lock (unless dryRun).
@@ -496,11 +535,12 @@ export async function runProject(cfg: RunProjectConfig): Promise<RunProjectResul
         await appendBoundedRunLog(logPath, {
           ts: new Date().toISOString(), projectId: paths.projectId, status, blockers: blockers.length,
           stages: orchestration?.downstream?.executedStages ?? [], lockAcquired: lock !== null,
+          preflight: preflight?.status ?? 'SKIPPED',
         }, { maxBytes: cfg.logMaxBytes, retention: cfg.logRetention });
       } catch { /* run log is best-effort */ }
     }
 
-    return { projectId: paths.projectId, status, blockers, completed, nextAction, resumable: true, lockAcquired: lock !== null, orchestration };
+    return { projectId: paths.projectId, status, blockers, completed, nextAction, resumable: true, lockAcquired: lock !== null, orchestration, ...(preflight ? { preflight } : {}) };
   } catch (e: any) {
     return { projectId: paths.projectId, status: 'RECOVERABLE_FAILURE', blockers: [{ category: 'other', detail: String(e?.message ?? e).slice(0, 200) }], completed: [], nextAction: 'Investigate the error and resume.', resumable: true, lockAcquired: lock !== null };
   } finally {

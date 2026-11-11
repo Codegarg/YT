@@ -29,6 +29,7 @@ import { planIsolatedSceneMix, runIsolatedSceneMix, parseMaxStretchOverride } fr
 import { MAX_NARRATION_VIDEO_STRETCH } from './narrationDurationPolicy.js';
 import { runMediaQa, renderMediaQaReport } from './mediaQa.js';
 import { runProjectMediaQa, renderProjectQaReport } from './projectMediaQa.js';
+import { evaluateOutputContract, renderOutputContractReport } from './outputContract.js';
 import { generationLedgerPath, readGenerationLedger, renderGenerationHistory } from './generationAttempts.js';
 import { createPythonStoryValidator, renderStoryReport, type StoryValidationResult } from './storyValidation.js';
 
@@ -48,6 +49,7 @@ function baseOptions() {
     inputsRoot: INPUTS_ROOT,
     outputsRoot: OUTPUTS_ROOT,
     ffprobePath: process.env.FFPROBE_PATH,
+    ffmpegPath: process.env.FFMPEG_PATH,
     productionDir: PRODUCTION_DIR,
     logRetention: process.env.LOG_RETENTION ? Number(process.env.LOG_RETENTION) : undefined,
     logMaxBytes: process.env.LOG_MAX_BYTES ? Number(process.env.LOG_MAX_BYTES) : undefined,
@@ -202,7 +204,7 @@ function renderSeoSummary(r: SeoResult): string {
  * when `--run-flow` without a session), and the interactive Flow session ONLY when explicitly
  * requested. Flow work itself remains gated by `runFlow` + eligibility inside the workflow.
  */
-export function buildResumeOptions(runFlow: boolean, includeSession: boolean, only?: number[]) {
+export function buildResumeOptions(runFlow: boolean, includeSession: boolean, only?: number[], preflight = false) {
   const sessionOpts = runFlow && includeSession ? flowSessionOptions() : {};
   return {
     ...baseOptions(),
@@ -212,6 +214,7 @@ export function buildResumeOptions(runFlow: boolean, includeSession: boolean, on
     ...storyValidationOptions(),
     only,
     runFlow,
+    preflight,
   };
 }
 
@@ -233,9 +236,12 @@ function emit(r: WorkflowResult): number {
  */
 export function renderUsage(): string {
   return [
-    'Usage: npm run video -- <create|resume|status|validate|approve|publish-status|health|seo|qa|mix-validate|flow-attempts>',
-    '  [--title ...] [--project <pipeline.json>] [--only 1,2,3] [--run-flow] [--flow-session] [--yes] [--json]',
+    'Usage: npm run video -- <create|resume|status|validate|approve|publish-status|health|seo|qa|contract|mix-validate|flow-attempts>',
+    '  [--title ...] [--project <pipeline.json>] [--only 1,2,3] [--run-flow] [--flow-session] [--preflight] [--yes] [--json]',
     '  create: [--seo]   # opt-in: also generate the reviewable SEO package for the new story',
+    '  resume: [--preflight]  # opt-in resource preflight (ffmpeg/ffprobe, outputs dir, free disk);',
+    '       # a real blocker fails closed before the lock is taken. Status/dry inspection never',
+    '       # probes or creates anything.',
     '  validate: --project <pipeline.json> | --project-id <id> [--json] [--strict]',
     '       # READ-ONLY story & scene intelligence: structural BLOCKERs, human-review WARNINGs and',
     '       # INFO context. It writes nothing, calls no model and spends no credits. Exit 0 = no',
@@ -274,6 +280,14 @@ export function renderUsage(): string {
     '      # READ-ONLY project QA: per-scene clips + render-sidecar provenance, narration audio',
     '      # and the final TITLE artifact, with an artifact hash bound to the exact bytes.',
     '      # Exit 0 = PASS/WARNING (warnings printed), 1 = FAIL, 2 = usage.',
+    '  contract: --project <pipeline.json> | --project-id <id> [--json]',
+    '      [--final <artifact>] [--sha256 <expected SHA-256>] [--qa-warnings-block]',
+    '      [--expect-duration <s>] [--duration-tolerance 2] [--min-height 720] [--target-height 720]',
+    '      # READ-ONLY long-form output contract: duration tolerance, streams, 16:9/resolution, fps,',
+    '      # A/V sync, scene order, narration coverage, TITLE/branding, QA hash binding and the human',
+    '      # approval verdict, as ONE mapped report. Rendering success never makes it publishable:',
+    '      # publishable requires a QA-clean artifact + explicit hash-bound approval. It never',
+    '      # approves, uploads or publishes. Exit 0 = PASS/WARNING, 1 = FAIL, 2 = usage.',
     '  mix-validate: [--scene N] --input-root <production/inputs/<projectId>> --validation-root <isolated dir>',
     '                 [--output <file>] [--force] [--max-stretch <x>]',
     '                 # renders ONE scene; never runs EDIT/MIX-stage/BED/TITLE/APPROVAL,',
@@ -413,7 +427,7 @@ async function main(): Promise<number> {
     const runFlow = hasFlag('--run-flow');
     const onlyResolved = resolveOnlyArg(arg('--only'));
     if (!onlyResolved.ok) { console.error(`video resume: ${onlyResolved.reason}`); return 2; }
-    const r = await resumeProjectWorkflow({ ...buildResumeOptions(runFlow, hasFlag('--flow-session'), onlyResolved.only), projectId });
+    const r = await resumeProjectWorkflow({ ...buildResumeOptions(runFlow, hasFlag('--flow-session'), onlyResolved.only, hasFlag('--preflight')), projectId });
     return emit(r);
   }
 
@@ -675,6 +689,66 @@ async function main(): Promise<number> {
     if (jsonFlag()) console.log(JSON.stringify(report, null, 2));
     else console.log(renderMediaQaReport(report));
     return report.ok ? 0 : 1;
+  }
+
+  if (command === 'contract') {
+    // READ-ONLY long-form output contract. Composes the Phase 4 QA report and the durable
+    // approval verdict into ONE mapped view. It never approves, uploads, publishes or renders.
+    const projectArg = arg('--project');
+    const projectIdArg = arg('--project-id');
+    if (!projectArg && !projectIdArg) {
+      console.error('video contract requires --project <pipeline.json> or --project-id <id>.');
+      return 2;
+    }
+    const projectId = projectArg ? path.basename(path.dirname(path.resolve(String(projectArg)))) : String(projectIdArg ?? '').trim();
+    if (!projectId || !/^[A-Za-z0-9._-]+$/.test(projectId)) {
+      console.error('video contract: --project-id must be a safe project id.');
+      return 2;
+    }
+    const pipelineFile = projectArg ? path.resolve(String(projectArg)) : path.join(PROJECTS_ROOT, projectId, 'pipeline.json');
+    let pipeline: any;
+    try {
+      const fsp = await import('node:fs/promises');
+      pipeline = JSON.parse(await fsp.readFile(pipelineFile, 'utf8'));
+    } catch (e: any) {
+      console.error(`video contract: could not read pipeline ${pipelineFile}: ${String(e?.message ?? e).slice(0, 160)}`);
+      return 2;
+    }
+    const numeric = (name: string): number | undefined => {
+      const raw = arg(name);
+      if (raw === undefined) return undefined;
+      const value = Number(raw);
+      return Number.isFinite(value) ? value : NaN;
+    };
+    for (const name of ['--expect-duration', '--duration-tolerance', '--min-height', '--target-height'] as const) {
+      const value = numeric(name);
+      if (typeof value === 'number' && Number.isNaN(value)) {
+        console.error(`video contract: ${name} must be a number, got "${arg(name)}".`);
+        return 2;
+      }
+    }
+    const finalArg = arg('--final');
+    const expectedHash = arg('--sha256');
+    const report = await evaluateOutputContract({
+      projectId,
+      pipeline,
+      outputsRoot: OUTPUTS_ROOT,
+      outputsDir: path.join(OUTPUTS_ROOT, projectId),
+      inputRoot: path.join(INPUTS_ROOT, projectId),
+      candidatePath: finalArg ? path.resolve(String(finalArg)) : undefined,
+      expectedHash,
+      ffmpegPath: process.env.FFMPEG_PATH,
+      ffprobePath: process.env.FFPROBE_PATH,
+      minHeight: numeric('--min-height'),
+      targetHeight: numeric('--target-height'),
+      expectedFinalDurationSeconds: numeric('--expect-duration'),
+      finalDurationToleranceSeconds: numeric('--duration-tolerance'),
+      sceneDurationToleranceSeconds: numeric('--duration-tolerance'),
+      blockOnMediaQaWarnings: hasFlag('--qa-warnings-block'),
+    });
+    if (jsonFlag()) console.log(JSON.stringify(report, null, 2));
+    else console.log(renderOutputContractReport(report));
+    return report.status === 'FAIL' ? 1 : 0;
   }
 
   console.error(renderUsage());

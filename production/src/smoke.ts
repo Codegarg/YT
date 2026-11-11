@@ -342,7 +342,7 @@ const checkCliHelp: Check = async () => {
   );
   const text = `${res.stdout}\n${res.stderr}`;
   if (res.code !== 0) return result('cli-help', 'FAIL', `--help exited ${res.code ?? 'null'}: ${tail(text)}`);
-  if (!text.includes('<create|resume|status|validate|approve|publish-status|health|seo|qa|mix-validate|flow-attempts>')) {
+  if (!text.includes('<create|resume|status|validate|approve|publish-status|health|seo|qa|contract|mix-validate|flow-attempts>')) {
     return result('cli-help', 'FAIL', 'usage text did not list the supported commands');
   }
   return result('cli-help', 'PASS', 'video --help exits 0 and lists every command');

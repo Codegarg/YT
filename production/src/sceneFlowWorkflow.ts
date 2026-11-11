@@ -880,6 +880,20 @@ export async function processSingleFlowScene(
       return { ...base, status: 'DOWNLOAD_FAILED', detail: String(dl0?.reason ?? dl0?.result ?? 'download failed').slice(0, 200) };
     }
     const meta0 = await validateVideoClip(dest, { ffprobePath: config.ffprobePath });
+    // A download transport success is NOT a usable scene. Claiming success here would let a
+    // truncated/zero-byte/corrupt file masquerade as a finished clip and be reused for every
+    // later run (the exact long-form failure mode Phase 5 exists to prevent). Validate FIRST;
+    // only a VALID file earns the success checkpoint. A partial file is left on disk untouched
+    // so an operator can inspect it, and the next run retries the (already committed) download.
+    if (meta0.state !== 'VALID') {
+      await writeSceneCheckpoint(checkpointPath, {
+        schema_version: SCENE_CHECKPOINT_SCHEMA_VERSION, project_id: config.projectId, scene_number: sceneNumber,
+        flow_scene_id: scene?.flow_scene_id ?? null, flow_scene_url: scene?.flow_scene_url ?? null, generation_uuid: null,
+        local_clip_path: null, local_clip_sha256: null, duration_seconds: null, width: null, height: null,
+        video_codec: null, audio_codec: null, workflow_status: 'DOWNLOAD_FAILED', updated_at: new Date().toISOString(),
+      });
+      return { ...base, status: 'DOWNLOAD_FAILED', detail: `downloaded clip failed validation (${meta0.state})`, downloads: 1 };
+    }
     await writeSceneCheckpoint(checkpointPath, {
       schema_version: SCENE_CHECKPOINT_SCHEMA_VERSION, project_id: config.projectId, scene_number: sceneNumber,
       flow_scene_id: scene?.flow_scene_id ?? null, flow_scene_url: scene?.flow_scene_url ?? null, generation_uuid: null,
@@ -989,6 +1003,19 @@ export async function processSingleFlowScene(
     return { ...base, status: 'DOWNLOAD_FAILED', generationAttempts, detail };
   }
   const meta = await validateVideoClip(dest, { ffprobePath: config.ffprobePath });
+  // Same rule as the committed-download branch: a transport success is not a usable clip. Record
+  // the attempt as FAILED (retryable) and a DOWNLOAD_FAILED checkpoint, never SUCCEEDED.
+  if (meta.state !== 'VALID') {
+    const detail = `downloaded clip failed validation (${meta.state})`;
+    await closeAttempt('FAILED', detail, { category: 'RETRYABLE', submission: 'SUBMITTED_CONFIRMED', clipDownloaded: true, validationPassed: false });
+    await writeSceneCheckpoint(checkpointPath, {
+      schema_version: SCENE_CHECKPOINT_SCHEMA_VERSION, project_id: config.projectId, scene_number: sceneNumber,
+      flow_scene_id: scene?.flow_scene_id ?? null, flow_scene_url: scene?.flow_scene_url ?? null, generation_uuid: generated!.artifactId,
+      local_clip_path: null, local_clip_sha256: null, duration_seconds: null, width: null, height: null,
+      video_codec: null, audio_codec: null, workflow_status: 'DOWNLOAD_FAILED', updated_at: new Date().toISOString(),
+    });
+    return { ...base, status: 'DOWNLOAD_FAILED', generationAttempts, downloads: 1, detail };
+  }
   await writeSceneCheckpoint(checkpointPath, {
     schema_version: SCENE_CHECKPOINT_SCHEMA_VERSION, project_id: config.projectId, scene_number: sceneNumber,
     flow_scene_id: scene?.flow_scene_id ?? null, flow_scene_url: scene?.flow_scene_url ?? null, generation_uuid: generated!.artifactId,
@@ -1001,7 +1028,7 @@ export async function processSingleFlowScene(
   await closeAttempt('SUCCEEDED', null, {
     submission: 'SUBMITTED_CONFIRMED',
     clipDownloaded: true,
-    validationPassed: meta.state === 'VALID',
+    validationPassed: true,
   });
   return { ...base, status: 'DOWNLOAD_SUCCESS', localClipPath: dest, sha256: meta.sha256 ?? null, durationSeconds: meta.durationSeconds, width: meta.video?.width, height: meta.video?.height, videoCodec: meta.video?.codec, audioCodec: meta.audio?.codec, generationAttempts, downloads: 1 };
 }
