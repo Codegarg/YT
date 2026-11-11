@@ -236,7 +236,7 @@ The music downloader saves a license record beside the downloaded file. Final FF
 
 ### Read-only checks before approval
 
-Four checks never write, never call a paid API and never upload. Run them before the approval questions:
+These checks never write, never call a paid API and never upload. Run them before the approval questions:
 
 ```powershell
 # 0. environment/setup readiness for this checkout (offline, free, temp writes only)
@@ -252,8 +252,13 @@ cd ..\scripting
 .venv\Scripts\python.exe -m pipeline.one_minute --project-id your-project --check
 cd ..\production
 
-# 3. finished-render QA: 16:9, resolution, black/freeze frames, loudness, clipping (read-only)
+# 3. finished-render QA: 16:9, resolution, frame rate, black/freeze frames, silence,
+#    loudness, clipping, A/V duration (read-only)
 npm run video -- qa --input outputs\your-project\final-title.mp4 --json
+
+# 3b. whole-project QA: every scene + render-sidecar provenance, narration audio and the final
+#     TITLE artifact, with blocker/warning counts and an artifact hash (read-only)
+npm run video -- qa --project ..\scripting\projects\your-project\pipeline.json
 ```
 
 Validation classifies findings as `BLOCKER` (the project cannot be produced correctly),
@@ -265,9 +270,19 @@ subprocess, so a blocked story never spends a credit. See
 relation to the generation-attempt budgets.
 
 `validate` and `--check` exit nonzero only for structural blockers (or warnings with
-`--strict`); `qa` exits nonzero only for hard failures (unreadable container, wrong aspect,
-sub-minimum resolution, duration out of tolerance, clipping/true-peak at full scale). Neither
-command approves, publishes or changes a file.
+`--strict`). `qa` exits nonzero only for hard failures — missing/corrupt media, missing required
+streams, wrong aspect/dimensions/frame rate, duration out of tolerance, A/V duration mismatch,
+clipping/true-peak at full scale, silent narration — while black frames, freezes, loudness drift
+and intentionally dark/still horror footage are warnings. Neither command approves, publishes or
+changes a file.
+
+Project QA uses explicit `PASS` / `WARNING` / `FAIL` / `SKIPPED` checks (check id, asset,
+expected, actual, severity, explanation, remedy) and reports `sha256`/`artifactHash` for the exact
+bytes it measured. `video approve` runs the same QA read-only against the exact artifact being
+approved: **blockers always refuse approval**, warnings are stored in the approval record and
+shown to the reviewer, and `--qa-warnings-block` makes warnings blocking too. If an artifact
+changes after QA, its stored evidence no longer matches and approval becomes stale. See
+[`docs/MEDIA_QA.md`](docs/MEDIA_QA.md) for thresholds, the JSON contract and known limitations.
 
 See `docs/FUTURE_PIPELINE_OPTIMIZATION.md` for the full architecture audit, the target stage contract, and the documented (not yet implemented) improvements.
 
@@ -283,6 +298,8 @@ npm run review -- reject --project ..\scripting\projects\your-project\pipeline.j
 ```
 
 A rejection prints the follow-up question, “Should I regenerate the video?” No regeneration or publishing occurs automatically.
+
+Integrity approval through `npm run video -- approve --project ... --yes` runs media QA read-only against the exact artifact being approved. Blockers refuse approval; warnings are recorded in `approval.json` under `media_qa` and shown to the reviewer. Add `--qa-warnings-block` to treat warnings as blocking too. A changed artifact invalidates the stored QA evidence and makes the approval stale. See [`docs/MEDIA_QA.md`](docs/MEDIA_QA.md).
 
 Zernio is optional and is used only after approval. Add a local `ZERNIO_API_KEY` to `scripting/.env` or your environment; the example value is intentionally blank and ignored by Git. Verify connected accounts with this read-only call:
 

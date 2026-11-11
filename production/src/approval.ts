@@ -21,6 +21,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { safeStageOutputPath, sha256OfFileOrNull, stageOutputName } from './downstreamStages.js';
 import { validateVideoClip } from './videoClip.js';
+import { projectQaEvidence, type MediaQaEvidence, type ProjectMediaQaReport } from './projectMediaQa.js';
 
 export const APPROVAL_SCHEMA_VERSION = 1;
 
@@ -55,6 +56,11 @@ export interface ApprovalRecord {
   approved_artifact_kind?: ApprovalArtifactKind;
   /** Required only for `candidate` records. */
   approved_candidate_provenance?: CandidateApprovalProvenance;
+  /**
+   * PHASE 4: optional QA evidence for the exact approved artifact. Absent means "legacy approval
+   * predating media QA" and stays valid; when present it must cover the approved artifact hash.
+   */
+  media_qa?: MediaQaEvidence;
 }
 
 export interface ApproveInput {
@@ -82,11 +88,30 @@ export interface ApproveInput {
   /** Test/CLI seams. */
   now?: string;
   inspectProject?: (args: any) => Promise<any>;
+  /**
+   * PHASE 4 media QA boundary. When supplied, QA runs read-only against the exact artifact being
+   * approved and must not FAIL. Omitted ⇒ legacy behavior (no QA evidence attached).
+   */
+  mediaQa?: (args: {
+    projectId: string;
+    outputsDir: string;
+    inputRoot: string;
+    pipeline: any;
+    /** Absolute path of the exact artifact being approved (canonical or candidate). */
+    finalPath: string;
+    ffprobePath?: string;
+    ffmpegPath?: string;
+    now?: string;
+  }) => Promise<ProjectMediaQaReport>;
+  /** Explicit reviewer choice: QA warnings also block. Default false (warnings stay visible). */
+  blockOnMediaQaWarnings?: boolean;
+  /** ffmpeg binary for the QA boundary (defaults to the QA module's own resolution). */
+  ffmpegPath?: string;
 }
 
 export type ApproveOutcome =
   | { ok: true; record: ApprovalRecord; idempotent: boolean }
-  | { ok: false; code: 'PRECONDITION_FAILED'; reason: string };
+  | { ok: false; code: 'PRECONDITION_FAILED' | 'QA_BLOCKED' | 'QA_UNAVAILABLE' | 'QA_STALE'; reason: string };
 
 export type ApprovalVerdict =
   | { status: 'APPROVED'; record: ApprovalRecord; finalOutputHash: string; finalOutputPath: string }
@@ -224,6 +249,25 @@ export function validateApprovalRecord(record: unknown, projectId?: string): { o
     }
   }
 
+  if (r.media_qa !== undefined) {
+    const qa = r.media_qa as Partial<MediaQaEvidence> | null;
+    if (!qa || typeof qa !== 'object') return { ok: false, reason: 'approval media_qa evidence must be an object' };
+    if (!['PASS', 'WARNING', 'FAIL', 'SKIPPED'].includes(String(qa.status))) {
+      return { ok: false, reason: `invalid approval media_qa status "${String(qa.status)}"` };
+    }
+    if (!HEX64.test(String(qa.artifact_hash ?? ''))) return { ok: false, reason: 'approval media_qa evidence is missing a valid artifact hash' };
+    if (!HEX64.test(String(qa.report_hash ?? ''))) return { ok: false, reason: 'approval media_qa evidence is missing a valid report hash' };
+    if (typeof qa.generated_at !== 'string' || !qa.generated_at.trim()) return { ok: false, reason: 'approval media_qa evidence is missing generated_at' };
+    if (!Number.isFinite(Number(qa.blockers)) || !Number.isFinite(Number(qa.warnings))) {
+      return { ok: false, reason: 'approval media_qa evidence is missing blocker/warning counts' };
+    }
+    if (!Array.isArray(qa.checks)) return { ok: false, reason: 'approval media_qa evidence is missing its checks list' };
+    if (qa.status === 'FAIL') return { ok: false, reason: 'approval media_qa evidence records blocking failures' };
+    if (String(qa.artifact_hash).toLowerCase() !== String(r.approved_final_output_hash).toLowerCase()) {
+      return { ok: false, reason: 'approval media_qa evidence does not cover the approved artifact hash' };
+    }
+  }
+
   if (/blob:|cookie|authorization|bearer|chrome-profile|access_token/i.test(JSON.stringify(record))) return { ok: false, reason: 'approval record contains forbidden secret material' };
   return { ok: true };
 }
@@ -312,6 +356,18 @@ export async function evaluateApproval(input: ApproveInput): Promise<ApprovalVer
   }
   const clip = await validateVideoClip(approvedPath.absPath, { ffprobePath: input.ffprobePath });
   if (clip.state !== 'VALID') return { status: 'STALE_APPROVAL', record, reason: `approved final output failed media validation (${clip.state})` };
+
+  // PHASE 4: persisted QA evidence must describe THIS artifact and must not record blockers.
+  // Legacy approvals without media_qa stay valid; evidence for a different hash never authorizes
+  // the current file.
+  if (record.media_qa) {
+    if (String(record.media_qa.artifact_hash).toLowerCase() !== actual.toLowerCase()) {
+      return { status: 'STALE_APPROVAL', record, reason: 'media QA evidence does not cover the approved artifact' };
+    }
+    if (record.media_qa.status === 'FAIL') {
+      return { status: 'STALE_APPROVAL', record, reason: 'media QA evidence recorded blocking failures for this artifact' };
+    }
+  }
 
   // A candidate is NOT the TITLE output, so its approval additionally has to remain tied to the
   // TITLE sidecar recorded at approval time. Missing/changed provenance is stale, never a reason
@@ -426,7 +482,45 @@ export async function approveProject(input: ApproveInput): Promise<ApproveOutcom
   const clip = await validateVideoClip(target.absPath, { ffprobePath: input.ffprobePath });
   if (clip.state !== 'VALID') return { ok: false, code: 'PRECONDITION_FAILED', reason: `${target.kind === 'candidate' ? 'candidate' : 'TITLE'} output failed media validation (${clip.state})` };
 
-  // 2. Build the durable record. Canonical records keep the legacy shape; candidate records
+  // 2. PHASE 4 media QA gate (READ-ONLY). Only active when a QA boundary is injected; it must
+  // evaluate the exact artifact verified above, never a different render.
+  let qaEvidence: MediaQaEvidence | undefined;
+  if (input.mediaQa) {
+    let qaReport: ProjectMediaQaReport;
+    try {
+      qaReport = await input.mediaQa({
+        projectId: input.projectId,
+        outputsDir,
+        inputRoot: input.inputRoot,
+        pipeline: input.pipeline,
+        finalPath: target.absPath,
+        ffprobePath: input.ffprobePath,
+        ffmpegPath: input.ffmpegPath,
+        now: input.now,
+      });
+    } catch (e: any) {
+      return { ok: false, code: 'QA_UNAVAILABLE', reason: `media QA could not run: ${String(e?.message ?? e).slice(0, 160)}` };
+    }
+    if (!qaReport || typeof qaReport !== 'object' || !qaReport.artifactHash) {
+      return { ok: false, code: 'QA_UNAVAILABLE', reason: 'media QA did not evaluate a final artifact' };
+    }
+    if (String(qaReport.artifactHash).toLowerCase() !== actual.toLowerCase()) {
+      return { ok: false, code: 'QA_STALE', reason: 'media QA evaluated a different artifact hash than the one being approved' };
+    }
+    if (qaReport.status === 'FAIL') {
+      const first = qaReport.checks.find((check) => check.status === 'FAIL');
+      const detail = first ? `: ${first.asset} ${first.id} — ${first.explanation}` : '';
+      return { ok: false, code: 'QA_BLOCKED', reason: `media QA found ${qaReport.counts.blockers} blocking issue(s)${detail}` };
+    }
+    if (qaReport.status === 'WARNING' && input.blockOnMediaQaWarnings) {
+      return { ok: false, code: 'QA_BLOCKED', reason: `media QA produced ${qaReport.counts.warnings} warning(s) and warnings are configured to block approval` };
+    }
+    const evidence = projectQaEvidence(qaReport);
+    if (!evidence) return { ok: false, code: 'QA_UNAVAILABLE', reason: 'media QA evidence could not be associated with the approved artifact' };
+    qaEvidence = evidence;
+  }
+
+  // 3. Build the durable record. Canonical records keep the legacy shape; candidate records
   // explicitly declare that they are not the TITLE output and bind the current TITLE sidecar.
   const record: ApprovalRecord = {
     schema_version: APPROVAL_SCHEMA_VERSION,
@@ -445,9 +539,20 @@ export async function approveProject(input: ApproveInput): Promise<ApproveOutcom
         source_output_hash: String(rec.output_hash).toLowerCase(),
       },
     } : {}),
+    ...(qaEvidence ? { media_qa: qaEvidence } : {}),
   };
 
-  // 3. Idempotency: an identical existing approval is left byte-identical (no churn).
+  // 4. Idempotency: an identical existing approval is left byte-identical (no churn). QA evidence
+  // is compared by artifact + status + counts so an unchanged artifact stays idempotent even
+  // though a fresh report carries a new timestamp.
+  const sameEvidence = (left?: MediaQaEvidence, right?: MediaQaEvidence): boolean => {
+    if (!left && !right) return true;
+    if (!left || !right) return false;
+    return String(left.artifact_hash).toLowerCase() === String(right.artifact_hash).toLowerCase()
+      && left.status === right.status
+      && Number(left.blockers) === Number(right.blockers)
+      && Number(left.warnings) === Number(right.warnings);
+  };
   const existing = await loadApproval(outputsDir, input.projectId);
   const existingRelative = existing ? normalizeRelativeOutputPath(existing.approved_final_output_path) : null;
   const existingProvenance = existing?.approved_candidate_provenance;
@@ -464,6 +569,7 @@ export async function approveProject(input: ApproveInput): Promise<ApproveOutcom
     && existing.approved_final_output_hash.toLowerCase() === record.approved_final_output_hash.toLowerCase()
     && existing.approved_final_stage_key === record.approved_final_stage_key
     && sameProvenance
+    && sameEvidence(existing.media_qa, qaEvidence)
     && existing.status === 'approved') {
     return { ok: true, record: existing, idempotent: true };
   }

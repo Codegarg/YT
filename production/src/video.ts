@@ -28,6 +28,7 @@ import { getProjectHealth, renderHealthReport } from './projectHealth.js';
 import { planIsolatedSceneMix, runIsolatedSceneMix, parseMaxStretchOverride } from './isolatedSceneMix.js';
 import { MAX_NARRATION_VIDEO_STRETCH } from './narrationDurationPolicy.js';
 import { runMediaQa, renderMediaQaReport } from './mediaQa.js';
+import { runProjectMediaQa, renderProjectQaReport } from './projectMediaQa.js';
 import { generationLedgerPath, readGenerationLedger, renderGenerationHistory } from './generationAttempts.js';
 import { createPythonStoryValidator, renderStoryReport, type StoryValidationResult } from './storyValidation.js';
 
@@ -132,6 +133,32 @@ function seoOptions() {
   return { repoRoot: REPO_ROOT, projectsRoot: PROJECTS_ROOT };
 }
 
+/**
+ * PHASE 4 media QA boundary for approvals (READ-ONLY). Runs the project QA composition against
+ * the exact artifact being approved; it never writes media, state or approval records.
+ */
+function mediaQaBoundary() {
+  return async (args: {
+    projectId: string;
+    outputsDir: string;
+    inputRoot: string;
+    pipeline: any;
+    finalPath: string;
+    ffprobePath?: string;
+    ffmpegPath?: string;
+    now?: string;
+  }) => runProjectMediaQa({
+    projectId: args.projectId,
+    pipeline: args.pipeline,
+    outputsDir: args.outputsDir,
+    inputRoot: args.inputRoot,
+    finalPath: args.finalPath,
+    ffmpegPath: args.ffmpegPath ?? process.env.FFMPEG_PATH,
+    ffprobePath: args.ffprobePath ?? process.env.FFPROBE_PATH,
+    now: args.now,
+  });
+}
+
 /** Human-readable SEO summary (the JSON form is the parsed CLI report). */
 function renderSeoSummary(r: SeoResult): string {
   const lines: string[] = [];
@@ -217,6 +244,10 @@ export function renderUsage(): string {
     '       # Treat validation WARNINGs as blocking for PAID generation (--run-flow). Default:',
     '       # blockers stop generation; warnings are reported and reviewed by a human.',
     '  approve: [--candidate <path inside project outputs> --sha256 <expected SHA-256>]',
+    '       [--qa-warnings-block]',
+    '       # Media QA runs read-only against the exact artifact being approved; any blocker',
+    '       # refuses approval. Warnings are recorded for the reviewer and block only with',
+    '       # --qa-warnings-block. No path can auto-approve or publish.',
     '  flow-attempts: --project-id <id> | --project <pipeline.json> [--limit N] [--json]',
     '       # READ-ONLY: per-scene/asset attempt budget, failure category, submission state,',
     '       # manual-approval state and the recent attempt history from',
@@ -233,8 +264,16 @@ export function renderUsage(): string {
     '      [--target-lufs -14] [--loudness-tolerance 3] [--min-height 720] [--target-height 1080]',
     '      [--expect-duration <s>] [--duration-tolerance 2] [--black-min 0.5] [--freeze-min 3]',
     '      [--skip-black] [--skip-freeze] [--skip-audio]',
-    '      # READ-ONLY: black/freeze frames, 16:9 + resolution, clipping, loudness.',
+    '      # READ-ONLY: black/freeze frames, 16:9 + resolution, frame rate, container,',
+    '      # stream presence, audio duration/sync, clipping, loudness, silence.',
     '      # Never renders, writes, uploads or publishes; exit 1 only for hard FAIL findings.',
+    '  qa: --project <pipeline.json> | --project-id <id> [--json]',
+    '      [--final <artifact>] [--skip-scenes] [--skip-narration] [--skip-final]',
+    '      [--expect-duration <s>] [--duration-tolerance 2] [--min-height 720] [--target-height 720]',
+    '      [--skip-black] [--skip-freeze]',
+    '      # READ-ONLY project QA: per-scene clips + render-sidecar provenance, narration audio',
+    '      # and the final TITLE artifact, with an artifact hash bound to the exact bytes.',
+    '      # Exit 0 = PASS/WARNING (warnings printed), 1 = FAIL, 2 = usage.',
     '  mix-validate: [--scene N] --input-root <production/inputs/<projectId>> --validation-root <isolated dir>',
     '                 [--output <file>] [--force] [--max-stretch <x>]',
     '                 # renders ONE scene; never runs EDIT/MIX-stage/BED/TITLE/APPROVAL,',
@@ -403,7 +442,15 @@ async function main(): Promise<number> {
       const expectedHash = arg('--sha256');
       if (candidatePath && !expectedHash) { console.error('video approve --candidate requires --sha256 <expected candidate SHA-256>.'); return 2; }
       if (expectedHash && !/^[0-9a-f]{64}$/i.test(expectedHash)) { console.error('video approve --sha256 must be a 64-character SHA-256 hex digest.'); return 2; }
-      const r = await approveProject({ ...base, candidatePath, expectedHash });
+      const r = await approveProject({
+        ...base,
+        candidatePath,
+        expectedHash,
+        // PHASE 4: media QA must not FAIL before an approval can be recorded. Warnings stay
+        // visible in the record; they block only when the reviewer opts in.
+        mediaQa: mediaQaBoundary(),
+        blockOnMediaQaWarnings: hasFlag('--qa-warnings-block'),
+      });
       // Opt-in (never automatic) bridge: mirror a VALID integrity approval into an existing
       // `awaiting_approval` review record. Does not create review records, does not overwrite
       // posted/rejected history, and never bypasses integrity approval.
@@ -543,12 +590,6 @@ async function main(): Promise<number> {
     // READ-ONLY automated media QA probe (black/freeze frames, aspect/resolution, clipping,
     // loudness). It never renders, never writes, never opens a browser and never touches
     // Flow/Zernio/YouTube. Findings are advisory except for hard failures (exit 1).
-    const input = arg('--input');
-    if (!input) {
-      console.error('video qa requires --input <media file>.');
-      console.error('It analyses an EXISTING file read-only; it never renders or overwrites anything.');
-      return 2;
-    }
     const numeric = (name: string): number | undefined => {
       const raw = arg(name);
       if (raw === undefined) return undefined;
@@ -564,6 +605,56 @@ async function main(): Promise<number> {
         return 2;
       }
       parsed[name] = value;
+    }
+
+    const projectArg = arg('--project');
+    const projectIdArg = arg('--project-id');
+    if (projectArg || projectIdArg) {
+      // PHASE 4 project QA: scenes + narration + final roll-up. Still READ-ONLY.
+      const projectId = projectArg ? path.basename(path.dirname(path.resolve(String(projectArg)))) : String(projectIdArg ?? '').trim();
+      if (!projectId || !/^[A-Za-z0-9._-]+$/.test(projectId)) {
+        console.error('video qa: --project-id must be a safe project id.');
+        return 2;
+      }
+      const pipelineFile = projectArg ? path.resolve(String(projectArg)) : path.join(PROJECTS_ROOT, projectId, 'pipeline.json');
+      let pipeline: any;
+      try {
+        const fsp = await import('node:fs/promises');
+        pipeline = JSON.parse(await fsp.readFile(pipelineFile, 'utf8'));
+      } catch (e: any) {
+        console.error(`video qa: could not read pipeline ${pipelineFile}: ${String(e?.message ?? e).slice(0, 160)}`);
+        return 2;
+      }
+      const finalArg = arg('--final');
+      const report = await runProjectMediaQa({
+        projectId,
+        pipeline,
+        outputsDir: path.join(OUTPUTS_ROOT, projectId),
+        inputRoot: path.join(INPUTS_ROOT, projectId),
+        finalPath: finalArg ? path.resolve(String(finalArg)) : undefined,
+        ffmpegPath: process.env.FFMPEG_PATH,
+        ffprobePath: process.env.FFPROBE_PATH,
+        minHeight: parsed['--min-height'],
+        targetHeight: parsed['--target-height'],
+        expectedFinalDurationSeconds: parsed['--expect-duration'],
+        finalDurationToleranceSeconds: parsed['--duration-tolerance'],
+        sceneDurationToleranceSeconds: parsed['--duration-tolerance'],
+        skipScenes: hasFlag('--skip-scenes'),
+        skipNarration: hasFlag('--skip-narration'),
+        skipFinal: hasFlag('--skip-final'),
+        skipBlack: hasFlag('--skip-black'),
+        skipFreeze: hasFlag('--skip-freeze'),
+      });
+      if (jsonFlag()) console.log(JSON.stringify(report, null, 2));
+      else console.log(renderProjectQaReport(report));
+      return report.status === 'FAIL' ? 1 : 0;
+    }
+
+    const input = arg('--input');
+    if (!input) {
+      console.error('video qa requires --input <media file> or --project <pipeline.json> | --project-id <id>.');
+      console.error('It analyses EXISTING media read-only; it never renders or overwrites anything.');
+      return 2;
     }
     const report = await runMediaQa({
       input: path.resolve(String(input)),
