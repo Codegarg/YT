@@ -32,6 +32,7 @@ import { runProjectMediaQa, renderProjectQaReport } from './projectMediaQa.js';
 import { evaluateOutputContract, renderOutputContractReport } from './outputContract.js';
 import { generationLedgerPath, readGenerationLedger, renderGenerationHistory } from './generationAttempts.js';
 import { createPythonStoryValidator, renderStoryReport, type StoryValidationResult } from './storyValidation.js';
+import { planShorts, renderShorts, shortsStatus, qaShorts, approveShort, renderShortsStatus, renderShortsRenderReport } from './shortsWorkflow.js';
 
 function arg(name: string, fallback?: string): string | undefined { const i = process.argv.indexOf(name); return i >= 0 ? process.argv[i + 1] ?? fallback : fallback; }
 function jsonFlag(): boolean { return process.argv.includes('--json'); }
@@ -236,7 +237,7 @@ function emit(r: WorkflowResult): number {
  */
 export function renderUsage(): string {
   return [
-    'Usage: npm run video -- <create|resume|status|validate|approve|publish-status|health|seo|qa|contract|mix-validate|flow-attempts>',
+    'Usage: npm run video -- <create|resume|status|validate|approve|publish-status|health|seo|qa|contract|shorts|mix-validate|flow-attempts>',
     '  [--title ...] [--project <pipeline.json>] [--only 1,2,3] [--run-flow] [--flow-session] [--preflight] [--yes] [--json]',
     '  create: [--seo]   # opt-in: also generate the reviewable SEO package for the new story',
     '  resume: [--preflight]  # opt-in resource preflight (ffmpeg/ffprobe, outputs dir, free disk);',
@@ -288,6 +289,15 @@ export function renderUsage(): string {
     '      # approval verdict, as ONE mapped report. Rendering success never makes it publishable:',
     '      # publishable requires a QA-clean artifact + explicit hash-bound approval. It never',
     '      # approves, uploads or publishes. Exit 0 = PASS/WARNING, 1 = FAIL, 2 = usage.',
+    '  shorts <plan|render|status|qa|approve> --project <pipeline.json> | --project-id <id>',
+    '      [--short short-01] [--count 2|3] [--yes] [--by <name>] [--sha256 <hash>]',
+    '      [--qa-warnings-block] [--json]',
+    '      # PHASE 6: derive 2–3 standalone 1080×1920 vertical Shorts from the SAME story. Clips are',
+    '      # REUSED from existing scene outputs (no Flow run, no credits), reframed with recorded',
+    '      # crop/blur metadata, captioned in Devanagari and QA-ed with the Phase 4 media engine.',
+    '      # Everything is written under outputs/<id>/shorts/; the long-form artifacts and approval',
+    '      # record are never touched. approve requires --yes and a QA-clean artifact; each Short is',
+    '      # approved independently and nothing is ever uploaded or published. Exit 0 = ok, 1 = fail.',
     '  mix-validate: [--scene N] --input-root <production/inputs/<projectId>> --validation-root <isolated dir>',
     '                 [--output <file>] [--force] [--max-stretch <x>]',
     '                 # renders ONE scene; never runs EDIT/MIX-stage/BED/TITLE/APPROVAL,',
@@ -749,6 +759,120 @@ async function main(): Promise<number> {
     if (jsonFlag()) console.log(JSON.stringify(report, null, 2));
     else console.log(renderOutputContractReport(report));
     return report.status === 'FAIL' ? 1 : 0;
+  }
+
+  if (command === 'shorts') {
+    // PHASE 6: standalone vertical Shorts derived from the SAME story. Child scope only:
+    // everything is written under outputs/<id>/shorts/, the long-form pipeline/outputs/approval
+    // are read-only, no Flow run is possible from here, and nothing is ever uploaded or published.
+    const action = String(process.argv[3] ?? '').trim();
+    if (!['plan', 'render', 'status', 'qa', 'approve'].includes(action)) {
+      console.error('video shorts requires one of: plan | render | status | qa | approve');
+      return 2;
+    }
+    const projectArg = arg('--project');
+    const projectIdArg = arg('--project-id');
+    if (!projectArg && !projectIdArg) {
+      console.error('video shorts requires --project <pipeline.json> or --project-id <id>.');
+      return 2;
+    }
+    const projectId = projectArg ? path.basename(path.dirname(path.resolve(String(projectArg)))) : String(projectIdArg ?? '').trim();
+    if (!projectId || !/^[A-Za-z0-9._-]+$/.test(projectId)) {
+      console.error('video shorts: --project-id must be a safe project id.');
+      return 2;
+    }
+    const projectFile = projectArg ? path.resolve(String(projectArg)) : path.join(PROJECTS_ROOT, projectId, 'pipeline.json');
+    const shortId = String(arg('--short') ?? '').trim() || undefined;
+    const countRaw = arg('--count');
+    let count: number | undefined;
+    if (countRaw !== undefined) {
+      const parsed = Number(countRaw);
+      if (!Number.isInteger(parsed) || parsed < 2 || parsed > 3) {
+        console.error('video shorts: --count must be 2 or 3.');
+        return 2;
+      }
+      count = parsed;
+    }
+    if (action === 'approve' && !shortId) {
+      console.error('video shorts approve requires --short <short-id> (approval is per Short).');
+      return 2;
+    }
+    const shortsOptions = {
+      projectId,
+      projectFile,
+      outputsRoot: OUTPUTS_ROOT,
+      // Per-project inputs dir, matching the Phase 4 QA boundary (`inputs/<id>`).
+      inputRoot: path.join(INPUTS_ROOT, projectId),
+      ffmpegPath: process.env.FFMPEG_PATH,
+      ffprobePath: process.env.FFPROBE_PATH,
+    };
+    try {
+      if (action === 'plan') {
+        const result = await planShorts({ ...shortsOptions, count });
+        if (jsonFlag()) console.log(JSON.stringify(result, null, 2));
+        else {
+          console.log(`project:       ${result.projectId}`);
+          console.log(`plan:          ${result.planPath}${result.changed ? '' : ' (unchanged)'}`);
+          console.log(`shorts:        ${result.plan?.count ?? 0} of ${result.plan?.requested_count ?? count ?? 3} requested`);
+          for (const short of result.plan?.shorts ?? []) {
+            console.log(`  ${short.short_id}  scenes ${short.scene_refs.join(',')}  ~${short.estimated_duration_seconds}s  ${short.title}`);
+          }
+          for (const warning of result.warnings) console.log(`warning:       ${warning}`);
+          for (const error of result.errors) console.error(`error:         ${error}`);
+          console.log('note:          planning is read-only; no media was rendered, generated or uploaded.');
+        }
+        return result.ok ? 0 : 1;
+      }
+
+      if (action === 'render') {
+        const result = await renderShorts({ ...shortsOptions, shortId });
+        if (jsonFlag()) console.log(JSON.stringify(result, null, 2));
+        else console.log(renderShortsRenderReport(result));
+        return result.ok ? 0 : 1;
+      }
+
+      if (action === 'status') {
+        const report = await shortsStatus({ ...shortsOptions, shortId });
+        if (jsonFlag()) console.log(JSON.stringify(report, null, 2));
+        else console.log(renderShortsStatus(report));
+        return 0;
+      }
+
+      if (action === 'qa') {
+        const result = await qaShorts({ ...shortsOptions, shortId });
+        if (jsonFlag()) console.log(JSON.stringify(result, null, 2));
+        else {
+          for (const report of result.reports) {
+            console.log(`${report.shortId}: ${report.status} — ${report.reason}`);
+            if (report.reportPath) console.log(`  report: ${report.reportPath}`);
+          }
+          for (const error of result.errors) console.error(`error: ${error}`);
+          console.log('note:          QA is read-only on the media; it never approves, uploads or publishes.');
+        }
+        return result.ok ? 0 : 1;
+      }
+
+      const approval = await approveShort({
+        ...shortsOptions,
+        shortId: String(shortId),
+        approvedBy: arg('--by') ?? null,
+        expectedHash: arg('--sha256') ?? null,
+        blockOnWarnings: hasFlag('--qa-warnings-block'),
+        confirmed: hasFlag('--yes'),
+      });
+      if (jsonFlag()) console.log(JSON.stringify(approval, null, 2));
+      else {
+        console.log(`short:         ${approval.shortId}`);
+        console.log(`approval:      ${approval.status}`);
+        console.log(`reason:        ${approval.reason}`);
+        if (approval.outputHash) console.log(`artifact:      ${approval.outputHash}`);
+        if (approval.status === 'APPROVED') console.log('note:          approval is recorded locally; nothing was uploaded or published.');
+      }
+      return approval.status === 'APPROVED' ? 0 : 1;
+    } catch (error: any) {
+      console.error(`video shorts ${action}: ${String(error?.message ?? error).slice(0, 300)}`);
+      return 1;
+    }
   }
 
   console.error(renderUsage());

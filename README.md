@@ -327,6 +327,49 @@ checkpoint semantics, recovery rules, failure categories and known limitations.
 
 See `docs/FUTURE_PIPELINE_OPTIMIZATION.md` for the full architecture audit, the target stage contract, and the documented (not yet implemented) improvements.
 
+### YouTube Shorts from the same story (vertical, independent)
+
+Every story can also produce **two or three standalone vertical Shorts** (1080×1920) that reuse the
+already-rendered scene clips. Shorts are a child scope: they never touch the story, the long-form
+outputs, the long-form metadata or the long-form approval record.
+
+```powershell
+cd production
+
+# 1. derive 2–3 Shorts (score-based arc selection; deterministic for an unchanged story)
+npm run video -- shorts plan --project ..\scripting\projects\your-project\pipeline.json --count 3
+
+# 2. render them (reuses approved clips; no Flow, no credits, no browser)
+npm run video -- shorts render --project ..\scripting\projects\your-project\pipeline.json
+
+# 3. read-only status: state, QA, approval and the re-render reason per Short
+npm run video -- shorts status --project ..\scripting\projects\your-project\pipeline.json
+
+# 4. Shorts QA (Phase 4 media engine + the 9:16/caption/framing contract)
+npm run video -- shorts qa --project ..\scripting\projects\your-project\pipeline.json
+
+# 5. approve ONE Short explicitly (QA-clean, hash-bound)
+npm run video -- shorts approve --project ..\scripting\projects\your-project\pipeline.json --short short-01 --yes
+```
+
+- **Planning** scores every 3–6 scene window for hook, escalation, payoff and self-containment, then
+  picks non-overlapping arcs — not the first/middle/last sections.
+- **Reuse** verifies each clip's hash, provenance, duration and resolution. Portrait clips use
+  `cover`; landscape clips use a centred 9:16 `crop`; very wide shots keep the full frame over a
+  blurred backdrop; anything unusable is flagged `REPLACE_OR_REVIEW`.
+- **Rendering** targets 1080×1920 @ 24 fps, keeps A/V locked (`max(clip, narration)` windows),
+  normalises the narration bus to −14 LUFS, burns Devanagari captions and overlays the channel logo
+  top-right (the Shorts action rail owns the bottom-right).
+- **QA** adds exact 9:16 dimensions, portrait orientation, duration range, A/V sync, caption
+  timing/safe areas, scene completeness, duplicate clips, narration coverage, reframe metadata and
+  artifact hashing. REVIEW framing is a warning, a technically invalid Short never passes.
+- **Approval** is per Short and bound to the artifact hash and render key. A changed artifact or
+  input makes the approval stale. Nothing is ever uploaded or published from this layer.
+
+Everything is written under `outputs/<projectId>/shorts/`. See
+[`docs/SHORTS_PRODUCTION.md`](docs/SHORTS_PRODUCTION.md) for the plan format, reframing rules, render
+key, caption rules, QA checks, approval semantics, recovery/resume and known limitations.
+
 ### Approval and optional YouTube publishing
 
 The final title command printed by `start-video.ps1` includes `--project`. Once it finishes, the project enters `awaiting_approval` and asks two questions: “Should I approve this video?” and “Is it good to post on YouTube or not?” The answer is persisted in `pipeline.json`, so a later session can continue safely.
