@@ -370,6 +370,82 @@ Everything is written under `outputs/<projectId>/shorts/`. See
 [`docs/SHORTS_PRODUCTION.md`](docs/SHORTS_PRODUCTION.md) for the plan format, reframing rules, render
 key, caption rules, QA checks, approval semantics, recovery/resume and known limitations.
 
+### Hindi narration assets: inventory, QA and per-line approval
+
+Narration is still recorded by you in Google AI Studio and dropped into
+`production/inputs/<projectId>/narration/`. What Phase 7 adds is the missing bookkeeping over the files
+the mix already consumes — measured with `ffprobe`, hashed, tracked and independently approved. It never
+generates audio, calls a provider, opens a browser or rewrites your audio.
+
+```powershell
+cd production
+
+# 1. build/refresh the ledger (records codec, sample rate, channels, bytes SHA-256, measured duration)
+npm run video -- narration refresh --project ..\scripting\projects\your-project\pipeline.json
+
+# 2. read-only status: per-scene state, measured durations, invalidation, QA/approval verdicts
+npm run video -- narration status --project ..\scripting\projects\your-project\pipeline.json
+
+# 3. QA the current ledger (Phase 4 audio engine + the narration contract)
+npm run video -- narration qa --project ..\scripting\projects\your-project\pipeline.json
+
+# 4. approve the exact bytes (human decision; needs --yes and QA bound to those bytes)
+npm run video -- narration approve --project ..\scripting\projects\your-project\pipeline.json --yes --by "you"
+```
+
+- **States are explicit**: `ready` / `missing` / `empty` / `corrupt` / `format_invalid` / `stale` — a
+  stale or truncated line is never silently mixed.
+- **Narrator vs. dialogue** comes from the existing scene classifier: character scenes keep their Flow
+  audio and never get a narration asset.
+- **Pronunciation** is an optional read-only `narration/pronunciation.json` (longest-match rules, voice
+  override). A rule change marks the affected lines stale without touching a byte.
+- **Resume/invalidation** is content-addressed. One re-recorded line invalidates the long-form
+  mix/QA and exactly the Shorts that consumed it — nothing else.
+- **Approval is per asset**, bound to that asset's hash and its own QA verdict; untouched lines keep
+  their approval. Nothing is ever uploaded or published.
+
+Everything is written under `outputs/<projectId>/narration/`. See
+[`docs/NARRATION_ASSETS.md`](docs/NARRATION_ASSETS.md) for the ledger format, states, pronunciation
+sidecar, QA checks, approval semantics and known limitations.
+
+### Thumbnails and per-Short covers (deterministic, offline)
+
+Two independent deliverables: a **1280×720 (16:9)** long-form thumbnail and a **1080×1920 (9:16)** cover
+for each Short. Both are rendered offline with FFmpeg + libass from a still of an already-rendered scene
+clip plus the channel logo at the permanent lower-right position. No image-generation API is called, and
+a cover is never a crop of the long-form thumbnail.
+
+```powershell
+cd production
+
+# long-form thumbnail
+npm run video -- thumbnail plan    --project ..\scripting\projects\your-project\pipeline.json
+npm run video -- thumbnail render  --project ..\scripting\projects\your-project\pipeline.json
+npm run video -- thumbnail status  --project ..\scripting\projects\your-project\pipeline.json
+npm run video -- thumbnail qa      --project ..\scripting\projects\your-project\pipeline.json
+npm run video -- thumbnail approve --project ..\scripting\projects\your-project\pipeline.json --yes
+
+# one independent 9:16 cover per Short
+npm run video -- thumbnail plan   --project-id <projectId> --short short-01
+npm run video -- thumbnail render --project-id <projectId> --short short-01
+npm run video -- thumbnail qa     --project-id <projectId> --short short-01
+npm run video -- thumbnail approve --project-id <projectId> --short short-01 --yes
+```
+
+- **Concept, design and artifact are separate records**: `design.json` (geometry + sources) and the
+  rendered PNG are never the same thing, so editing a design re-renders while a changed clip only
+  invalidates the owners that used it.
+- **QA measures pixels**: exact dimensions/aspect/format, file size, hash binding, the ink box inside the
+  safe area, branding pixels inside the brand box, and a second render proving the recorded render key.
+- **Renders are atomic and resumable**: deterministic render keys, `REUSED` when nothing changed, and a
+  failed render leaves the previous artifact untouched.
+- **Approval is per owner** (long-form vs. each Short), bound to artifact hash + render key + QA report.
+  Nothing is ever uploaded or published.
+
+Written under `outputs/<projectId>/thumbnail/` and `outputs/<projectId>/shorts/<shortId>/cover/`. See
+[`docs/THUMBNAILS.md`](docs/THUMBNAILS.md) for layout contracts, the brand box geometry, the renderer,
+QA checks, approval semantics and known limitations.
+
 ### Approval and optional YouTube publishing
 
 The final title command printed by `start-video.ps1` includes `--project`. Once it finishes, the project enters `awaiting_approval` and asks two questions: “Should I approve this video?” and “Is it good to post on YouTube or not?” The answer is persisted in `pipeline.json`, so a later session can continue safely.

@@ -271,6 +271,12 @@ export interface ShortCheckpoint {
   height: number | null;
   scene_refs: number[];
   clip_hashes: Record<string, string>;
+  /**
+   * PHASE 7: narration hashes the Short was actually rendered from (scene → SHA-256).
+   * Additive and optional: older checkpoints simply omit it. It lets the narration ledger prove which
+   * Shorts depend on which line, so re-recording ONE line invalidates only the Shorts that used it.
+   */
+  narration_hashes?: Record<string, string>;
   caption_hash: string;
   metadata_hash: string;
   renderer_version: string;

@@ -14,6 +14,7 @@
  * OpenAI/network, NEVER approves and NEVER publishes.
  */
 import path from 'node:path';
+import fs from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 import { createProjectWorkflow, resumeProjectWorkflow, projectWorkflowStatus, renderWorkflowReport, type WorkflowResult } from './projectWorkflow.js';
 import { createPythonPipelineGenerator } from './pipelineGenerator.js';
@@ -33,6 +34,10 @@ import { evaluateOutputContract, renderOutputContractReport } from './outputCont
 import { generationLedgerPath, readGenerationLedger, renderGenerationHistory } from './generationAttempts.js';
 import { createPythonStoryValidator, renderStoryReport, type StoryValidationResult } from './storyValidation.js';
 import { planShorts, renderShorts, shortsStatus, qaShorts, approveShort, renderShortsStatus, renderShortsRenderReport } from './shortsWorkflow.js';
+import { refreshNarrationAssets, narrationStatus, qaNarrationAssets, approveNarrationAssets, renderNarrationStatus } from './narrationAssetWorkflow.js';
+import { renderNarrationQaReport } from './narrationQa.js';
+import { planThumbnail, renderThumbnailArtifact, qaThumbnailArtifact, approveThumbnailArtifact, thumbnailStatus, renderThumbnailStatus } from './thumbnailWorkflow.js';
+import { renderThumbnailQaReport } from './thumbnailQa.js';
 
 function arg(name: string, fallback?: string): string | undefined { const i = process.argv.indexOf(name); return i >= 0 ? process.argv[i + 1] ?? fallback : fallback; }
 function jsonFlag(): boolean { return process.argv.includes('--json'); }
@@ -237,7 +242,7 @@ function emit(r: WorkflowResult): number {
  */
 export function renderUsage(): string {
   return [
-    'Usage: npm run video -- <create|resume|status|validate|approve|publish-status|health|seo|qa|contract|shorts|mix-validate|flow-attempts>',
+    'Usage: npm run video -- <create|resume|status|validate|approve|publish-status|health|seo|qa|contract|shorts|narration|thumbnail|mix-validate|flow-attempts>',
     '  [--title ...] [--project <pipeline.json>] [--only 1,2,3] [--run-flow] [--flow-session] [--preflight] [--yes] [--json]',
     '  create: [--seo]   # opt-in: also generate the reviewable SEO package for the new story',
     '  resume: [--preflight]  # opt-in resource preflight (ffmpeg/ffprobe, outputs dir, free disk);',
@@ -298,6 +303,26 @@ export function renderUsage(): string {
     '      # Everything is written under outputs/<id>/shorts/; the long-form artifacts and approval',
     '      # record are never touched. approve requires --yes and a QA-clean artifact; each Short is',
     '      # approved independently and nothing is ever uploaded or published. Exit 0 = ok, 1 = fail.',
+    '  narration <refresh|status|qa|approve> --project <pipeline.json> | --project-id <id>',
+    '      [--yes] [--by <name>] [--qa-warnings-block] [--pronunciation <file>] [--json]',
+    '      # PHASE 7: the Hindi narration INVENTORY. Reads inputs/<id>/narration/, measures the real',
+    '      # duration with ffprobe, records container/codec/sample-rate/channels, bytes SHA-256, the',
+    '      # script text hash, the voice/pronunciation config hash and provenance. States are explicit:',
+    '      # ready / missing / empty / corrupt / format_invalid / stale. It never generates audio, never',
+    '      # calls a provider and never rewrites an operator audio file. Outputs',
+    '      # outputs/<id>/narration/{narration-ledger,narration-qa,narration-approval}.json.',
+    '      # approve requires --yes and a QA result bound to these exact bytes.',
+    '  thumbnail <plan|render|status|qa|approve> [--short <short-id>]',
+    '      --project <pipeline.json> | --project-id <id> [--headline <text>] [--subhead <text>]',
+    '      [--kicker <text>] [--scene N] [--designed-card] [--yes] [--by <name>] [--sha256 <hash>]',
+    '      [--qa-warnings-block] [--json]',
+    '      # PHASE 7: deterministic thumbnails. Without --short: the long-form 1280×720 16:9 thumbnail',
+    '      # under outputs/<id>/thumbnail/. With --short: that Short gets its own 1080×1920 9:16 cover',
+    '      # at outputs/<id>/shorts/<shortId>/cover/. A still is taken from an already-rendered scene clip',
+    '      # (or a deterministic card when none exists), Devanagari type is drawn with libass and the',
+    '      # channel logo is overlaid at the permanent lower-right position. No image-generation API is',
+    '      # ever called. QA measures the rendered ink box, verifies branding pixels and re-renders to',
+    '      # prove the recorded render key. approve requires --yes and a QA-clean artifact.',
     '  mix-validate: [--scene N] --input-root <production/inputs/<projectId>> --validation-root <isolated dir>',
     '                 [--output <file>] [--force] [--max-stretch <x>]',
     '                 # renders ONE scene; never runs EDIT/MIX-stage/BED/TITLE/APPROVAL,',
@@ -871,6 +896,238 @@ async function main(): Promise<number> {
       return approval.status === 'APPROVED' ? 0 : 1;
     } catch (error: any) {
       console.error(`video shorts ${action}: ${String(error?.message ?? error).slice(0, 300)}`);
+      return 1;
+    }
+  }
+
+  if (command === 'narration') {
+    // PHASE 7: narration INVENTORY + QA + per-asset approval. Read-only on the audio sources; writes
+    // only outputs/<id>/narration/. No provider call, no TTS, no network.
+    const action = String(process.argv[3] ?? '').trim();
+    if (!['refresh', 'status', 'qa', 'approve'].includes(action)) {
+      console.error('video narration requires one of: refresh | status | qa | approve');
+      return 2;
+    }
+    const projectArg = arg('--project');
+    const projectIdArg = arg('--project-id');
+    if (!projectArg && !projectIdArg) {
+      console.error('video narration requires --project <pipeline.json> or --project-id <id>.');
+      return 2;
+    }
+    const projectId = projectArg ? path.basename(path.dirname(path.resolve(String(projectArg)))) : String(projectIdArg ?? '').trim();
+    if (!projectId || !/^[A-Za-z0-9._-]+$/.test(projectId)) {
+      console.error('video narration: --project-id must be a safe project id.');
+      return 2;
+    }
+    const projectFile = projectArg ? path.resolve(String(projectArg)) : path.join(PROJECTS_ROOT, projectId, 'pipeline.json');
+    let pipeline: any = null;
+    try {
+      pipeline = JSON.parse(await fs.readFile(projectFile, 'utf8'));
+    } catch (error: any) {
+      if (action !== 'status') {
+        console.error(`video narration ${action}: cannot read ${projectFile} (${String(error?.message ?? error).slice(0, 160)})`);
+        return 1;
+      }
+    }
+    const narrationOptions = {
+      projectId,
+      pipeline,
+      outputsRoot: OUTPUTS_ROOT,
+      inputRoot: path.join(INPUTS_ROOT, projectId),
+      pronunciationPath: arg('--pronunciation') ?? null,
+      ffmpegPath: process.env.FFMPEG_PATH,
+      ffprobePath: process.env.FFPROBE_PATH,
+    };
+    try {
+      if (action === 'refresh') {
+        const result = await refreshNarrationAssets(narrationOptions);
+        if (jsonFlag()) console.log(JSON.stringify(result, null, 2));
+        else {
+          const ledger = result.ledger;
+          console.log(`project:       ${result.projectId}`);
+          console.log(`ledger:        ${result.ledgerPath}${result.written ? '' : ' (unchanged)'}`);
+          console.log(`voice:         ${ledger.voice.provider}/${ledger.voice.model}/${ledger.voice.voice} (${ledger.voice.language})`);
+          console.log(`narrator:      ${ledger.scene_texts.filter((plan) => plan.required).length} scene(s) require narration`);
+          console.log(`assets:        ${ledger.assets.filter((asset) => asset.state === 'ready').length} ready of ${ledger.assets.length}`);
+          console.log(`measured:      ${ledger.total_duration_seconds}s (ffprobe)`);
+          if (ledger.missing_scenes.length) console.log(`missing:       scene(s) ${ledger.missing_scenes.join(', ')}`);
+          if (ledger.stale_scenes.length) console.log(`stale:         scene(s) ${ledger.stale_scenes.join(', ')} (re-record)`);
+          if (ledger.invalid_scenes.length) console.log(`invalid:       scene(s) ${ledger.invalid_scenes.join(', ')}`);
+          for (const change of result.changes) if (change.bytes_changed || change.script_or_voice_changed) console.log(`changed:       ${change.asset} ${change.from ?? '(new)'} -> ${change.to}`);
+          if (result.invalidation.changed_scenes.length) console.log(`invalidated:   dependents ${Object.keys(result.invalidation.stale_dependents).join(', ')}`);
+          for (const warning of result.warnings) console.log(`warning:       ${warning}`);
+          console.log('note:          the narration audio files were NOT modified; nothing was generated or uploaded.');
+        }
+        const clean = result.ledger.missing_scenes.length === 0 && result.ledger.invalid_scenes.length === 0 && result.ledger.stale_scenes.length === 0;
+        return clean ? 0 : 1;
+      }
+
+      if (action === 'status') {
+        const report = await narrationStatus(narrationOptions);
+        if (jsonFlag()) console.log(JSON.stringify(report, null, 2));
+        else console.log(renderNarrationStatus(report));
+        return 0;
+      }
+
+      if (action === 'qa') {
+        const result = await qaNarrationAssets(narrationOptions);
+        if (jsonFlag()) console.log(JSON.stringify(result, null, 2));
+        else if (result.report) {
+          console.log(renderNarrationQaReport(result.report));
+          console.log(`report:        ${result.reportPath}${result.written ? '' : ' (unchanged)'}`);
+        }
+        for (const error of result.errors) console.error(`error:         ${error}`);
+        return result.ok ? 0 : 1;
+      }
+
+      const approval = await approveNarrationAssets({
+        ...narrationOptions,
+        approvedBy: arg('--by') ?? null,
+        blockOnWarnings: hasFlag('--qa-warnings-block'),
+        confirmed: hasFlag('--yes'),
+      });
+      if (jsonFlag()) console.log(JSON.stringify(approval, null, 2));
+      else {
+        console.log(`narration:     ${approval.projectId}`);
+        console.log(`approval:      ${approval.status}`);
+        console.log(`reason:        ${approval.reason}`);
+        if (approval.ok) console.log('note:          approval is local evidence for these exact bytes; nothing was uploaded or published.');
+      }
+      return approval.ok ? 0 : 1;
+    } catch (error: any) {
+      console.error(`video narration ${action}: ${String(error?.message ?? error).slice(0, 300)}`);
+      return 1;
+    }
+  }
+
+  if (command === 'thumbnail') {
+    // PHASE 7: deterministic thumbnails (long-form 1280×720 and per-Short 1080×1920 covers).
+    // Offline renderer only: a still from an existing clip (or a deterministic card) + libass type +
+    // the channel logo. No image-generation API, no Flow, no upload.
+    const action = String(process.argv[3] ?? '').trim();
+    if (!['plan', 'render', 'status', 'qa', 'approve'].includes(action)) {
+      console.error('video thumbnail requires one of: plan | render | status | qa | approve');
+      return 2;
+    }
+    const projectArg = arg('--project');
+    const projectIdArg = arg('--project-id');
+    if (!projectArg && !projectIdArg) {
+      console.error('video thumbnail requires --project <pipeline.json> or --project-id <id>.');
+      return 2;
+    }
+    const projectId = projectArg ? path.basename(path.dirname(path.resolve(String(projectArg)))) : String(projectIdArg ?? '').trim();
+    if (!projectId || !/^[A-Za-z0-9._-]+$/.test(projectId)) {
+      console.error('video thumbnail: --project-id must be a safe project id.');
+      return 2;
+    }
+    const projectFile = projectArg ? path.resolve(String(projectArg)) : path.join(PROJECTS_ROOT, projectId, 'pipeline.json');
+    const shortId = String(arg('--short') ?? '').trim() || undefined;
+    if (action === 'approve' && !hasFlag('--yes')) {
+      console.error('video thumbnail approve requires explicit --yes (approval is a human decision).');
+      return 2;
+    }
+    let pipeline: any = null;
+    try {
+      pipeline = JSON.parse(await fs.readFile(projectFile, 'utf8'));
+    } catch (error: any) {
+      if (action !== 'status') {
+        console.error(`video thumbnail ${action}: cannot read ${projectFile} (${String(error?.message ?? error).slice(0, 160)})`);
+        return 1;
+      }
+    }
+    const sceneArg = arg('--scene');
+    const sceneNumber = sceneArg !== undefined ? Number(sceneArg) : undefined;
+    if (sceneNumber !== undefined && (!Number.isInteger(sceneNumber) || sceneNumber < 1)) {
+      console.error('video thumbnail: --scene must be a positive integer.');
+      return 2;
+    }
+    const thumbnailOptions = {
+      projectId,
+      pipeline,
+      outputsRoot: OUTPUTS_ROOT,
+      inputRoot: path.join(INPUTS_ROOT, projectId),
+      shortId,
+      overrides: {
+        headline: arg('--headline') ?? null,
+        subhead: arg('--subhead') ?? null,
+        kicker: arg('--kicker') ?? null,
+        sceneNumber: sceneNumber ?? null,
+      },
+      backgroundMode: hasFlag('--designed-card') ? 'designed_card' as const : undefined,
+      ffmpegPath: process.env.FFMPEG_PATH,
+      ffprobePath: process.env.FFPROBE_PATH,
+    };
+    try {
+      if (action === 'plan') {
+        const result = await planThumbnail(thumbnailOptions);
+        if (jsonFlag()) console.log(JSON.stringify(result, null, 2));
+        else {
+          console.log(`thumbnail:     ${result.ownerId} (${result.kind})`);
+          console.log(`design:        ${result.designPath}${result.written ? '' : ' (unchanged)'}`);
+          if (result.design) {
+            const design = result.design;
+            console.log(`size:          ${design.width}x${design.height}`);
+            console.log(`headline:      ${design.concept.headline}`);
+            if (design.concept.subhead) console.log(`subhead:       ${design.concept.subhead}`);
+            console.log(`source:        ${design.sources.find((source) => source.role === 'base')?.relative_path ?? '(designed card)'}`);
+            console.log(`design hash:   ${design.design_hash}`);
+          }
+          for (const warning of result.warnings) console.log(`warning:       ${warning}`);
+          for (const error of result.errors) console.error(`error:         ${error}`);
+          console.log('note:          planning is read-only for media; no image API was called.');
+        }
+        return result.ok ? 0 : 1;
+      }
+
+      if (action === 'render') {
+        const result = await renderThumbnailArtifact(thumbnailOptions);
+        if (jsonFlag()) console.log(JSON.stringify(result, null, 2));
+        else {
+          console.log(`thumbnail:     ${result.ownerId} (${result.kind})`);
+          console.log(`render:        ${result.action}`);
+          console.log(`artifact:      ${result.artifactPath}`);
+          if (result.checkpoint) console.log(`sha256:        ${result.checkpoint.artifact_hash}`);
+          for (const warning of result.warnings) console.log(`warning:       ${warning}`);
+          for (const error of result.errors) console.error(`error:         ${error}`);
+        }
+        return result.action === 'FAILED' ? 1 : 0;
+      }
+
+      if (action === 'status') {
+        const report = await thumbnailStatus({ ...thumbnailOptions, pipeline: thumbnailOptions.pipeline });
+        if (jsonFlag()) console.log(JSON.stringify(report, null, 2));
+        else console.log(renderThumbnailStatus(report));
+        return 0;
+      }
+
+      if (action === 'qa') {
+        const result = await qaThumbnailArtifact(thumbnailOptions);
+        if (jsonFlag()) console.log(JSON.stringify(result, null, 2));
+        else if (result.report) {
+          console.log(renderThumbnailQaReport(result.report));
+          console.log(`  report:    ${result.reportPath}${result.written ? '' : ' (unchanged)'}`);
+        }
+        for (const error of result.errors) console.error(`error:         ${error}`);
+        return result.ok ? 0 : 1;
+      }
+
+      const approval = await approveThumbnailArtifact({
+        ...thumbnailOptions,
+        approvedBy: arg('--by') ?? null,
+        expectedHash: arg('--sha256') ?? null,
+        blockOnWarnings: hasFlag('--qa-warnings-block'),
+        confirmed: hasFlag('--yes'),
+      });
+      if (jsonFlag()) console.log(JSON.stringify(approval, null, 2));
+      else {
+        console.log(`thumbnail:     ${approval.ownerId} (${approval.kind})`);
+        console.log(`approval:      ${approval.status}`);
+        console.log(`reason:        ${approval.reason}`);
+        if (approval.ok) console.log('note:          approval is local evidence for these exact bytes; nothing was uploaded or published.');
+      }
+      return approval.status === 'APPROVED' ? 0 : 1;
+    } catch (error: any) {
+      console.error(`video thumbnail ${action}: ${String(error?.message ?? error).slice(0, 300)}`);
       return 1;
     }
   }

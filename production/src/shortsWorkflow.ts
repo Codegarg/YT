@@ -536,6 +536,9 @@ export async function renderShorts(options: WorkflowOptions & { shortId?: string
       height: probe.video?.height ?? SHORTS_HEIGHT,
       scene_refs: [...shortPlan.scene_refs],
       clip_hashes: Object.fromEntries(prepared.clips.filter((clip) => clip.sha256).map((clip) => [String(clip.scene_number), clip.sha256 as string])),
+      narration_hashes: Object.fromEntries(prepared.timeline.scenes
+        .filter((scene) => scene.narration_sha256)
+        .map((scene) => [String(scene.scene_number), String(scene.narration_sha256)])),
       caption_hash: prepared.captionHash,
       metadata_hash: prepared.metadata.metadata_hash,
       renderer_version: SHORTS_RENDERER_VERSION,
